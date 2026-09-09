@@ -36,7 +36,7 @@ a box border.
 | **latency** | IO completion histogram, seven buckets from `<0.1ms` to `>50ms`, with p50/p95/p99 and the share of ops past 10 ms. Bars are coloured by bucket, not by count, so the tail is visible before it fills. |
 | **volumes** | Capacity meters with a days-to-full projection from observed growth. Silent when a volume is flat or shrinking. |
 | **smart** | Health, wear, host writes, temperature, spare. |
-| **files** | Busiest paths by event rate. Filter with `/`, sort with `s`. |
+| **files** | Busiest paths by event rate, with the process holding each one. Filter with `/`, sort with `s`. |
 
 Falls back to a compact screen below 104×32, keeping the mirror and the percentiles.
 
@@ -54,8 +54,25 @@ Falls back to a compact screen below 104×32, keeping the mirror and the percent
 | 4 | FS | mounts with usage bars, thresholds, system/user/removable | `df -h`, `df -i`, `mount`, `findmnt` |
 | 5 | IO | per-device throughput, 48s sparkline, p50/p99 read and write | `iostat -x 1` |
 | 6 | SMART | full NVMe/ATA attribute tables when `smartctl` is present | `smartctl -A`, `nvme smart-log` |
-| 7 | Hot Files | paths by event rate (FSEvents / inotify) | `fatrace`, `fs_usage` |
+| 7 | Hot Files | paths by event rate (FSEvents / inotify), with the process holding each one | `fatrace`, `fs_usage`, `lsof` |
 | 8 | Insights | capacity, SMART, wear, temperature, latency and hot-file anomalies | — |
+
+### Who is writing that file
+
+Neither inotify nor FSEvents carries a pid, so the Hot Files PROCESS column is a join,
+not a measurement: diskwatch reads per-process byte rates (`/proc/<pid>/io`, `proc_pidinfo`)
+and open file descriptors (`/proc/<pid>/fd`, `PROC_PIDLISTFDS`), then names the busiest
+process holding each hot path open. Two limits, both stated on the tab rather than buried
+here:
+
+- **It is sampled every 2s.** A writer that opens, writes and closes between two samples
+  is missed. Compilers, `git` and package managers are the usual casualties.
+- **Unprivileged it sees only your uid.** The banner counts the processes it could not
+  read, so a mostly-empty column says why instead of looking broken. `sudo diskwatch`
+  attributes the rest.
+
+Getting an exact pid per event needs fanotify with `FAN_REPORT_PID` or eBPF, both root.
+diskwatch runs as you, so it infers instead and shows its working.
 
 ## Lite
 
@@ -64,7 +81,8 @@ diskwatch --lite
 ```
 
 80×24, six keys, no tabs: read and write throughput, a capacity line that answers *how long
-have I got*, and the busiest files. Sized for a tmux split or an SSH session to a NAS. Same
+have I got*, and the busiest files. `↵` opens a detail block naming the process holding the
+selected file; above 99 columns that becomes a PROCESS column of its own. Sized for a tmux split or an SSH session to a NAS. Same
 grid and keys as [`netwatch --lite`](https://github.com/matthart1983/netwatch).
 
 ## Install

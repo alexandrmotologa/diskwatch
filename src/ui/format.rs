@@ -38,6 +38,23 @@ pub fn fmt_rate(bps: f64) -> String {
     }
 }
 
+/// Bytes-per-second in prose, for running text rather than a column:
+/// no padding, and "idle" instead of a dash. [`fmt_rate`] is the
+/// fixed-width form the tables use.
+pub fn fmt_rate_compact(bps: f64) -> String {
+    if bps >= 1_000_000_000.0 {
+        format!("{:.1} GB/s", bps / 1_000_000_000.0)
+    } else if bps >= 1_000_000.0 {
+        format!("{:.1} MB/s", bps / 1_000_000.0)
+    } else if bps >= 1000.0 {
+        format!("{:.0} kB/s", bps / 1000.0)
+    } else if bps > 0.0 {
+        format!("{:.0} B/s", bps)
+    } else {
+        "idle".to_string()
+    }
+}
+
 pub fn pad_right(s: &str, n: usize) -> String {
     let len = s.chars().count();
     if len >= n {
@@ -79,5 +96,24 @@ pub fn usage_bar_color(used_pct: u32) -> Color {
         p::yellow()
     } else {
         p::green()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The compact form is for prose, so it carries no padding and says
+    /// "idle" where the column form would show a dash.
+    #[test]
+    fn the_compact_rate_reads_as_prose() {
+        assert_eq!(fmt_rate_compact(0.0), "idle");
+        assert_eq!(fmt_rate_compact(512.0), "512 B/s");
+        assert_eq!(fmt_rate_compact(2_000.0), "2 kB/s");
+        assert_eq!(fmt_rate_compact(5_400_000.0), "5.4 MB/s");
+        assert_eq!(fmt_rate_compact(2_100_000_000.0), "2.1 GB/s");
+        for bps in [0.0, 1.0, 999.0, 1e6, 1e12] {
+            assert!(!fmt_rate_compact(bps).starts_with(' '), "{bps}");
+        }
     }
 }

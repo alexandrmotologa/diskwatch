@@ -37,6 +37,9 @@
 //! - **The latency histogram** buckets per-tick mean service times weighted by
 //!   that tick's op count. It is not a per-operation histogram; see
 //!   [`crate::collect::io::IoTick::lat_hist`].
+//! - **PROC** in the files box is the busiest process holding the path open,
+//!   sampled on a slower cadence than the events themselves. It is a join,
+//!   not a per-event pid — see `collect::processes`.
 //! - **Hot files** are event rates from FSEvents/inotify, not per-file byte
 //!   rates, which no OS exposes without tracing. The column is labelled
 //!   `EVENTS/S` because that is what it is.
@@ -1923,12 +1926,19 @@ fn files_box(buf: &mut Buffer, area: Rect, app: &App, wide: bool) {
     let want_seen = w >= 76;
     let want_total = w >= 68;
     let want_kind = w >= 60;
+    // PROC is the widest of the optional columns and the last to be
+    // afforded, but it goes in ahead of the sparkline: knowing which
+    // process is writing beats seeing the shape of the writing.
+    let want_proc = w >= 92;
+    let proc_w: u16 = 18;
     // Everything to the right of DIR is fixed, so DIR gets the slack — the
     // path is the field that benefits most from an extra column and degrades
     // most gracefully without one.
     let fixed_right = 10 + u16::from(want_total) * 8 + u16::from(want_seen) * 7 + spark_w;
     let dir_w = w
-        .saturating_sub(29 + u16::from(want_kind) * 8 + fixed_right)
+        .saturating_sub(
+            29 + u16::from(want_kind) * 8 + u16::from(want_proc) * (proc_w + 1) + fixed_right,
+        )
         .min(44);
     let mut cols = vec![Col {
         lab: "FILE",
@@ -1945,6 +1955,15 @@ fn files_box(buf: &mut Buffer, area: Rect, app: &App, wide: bool) {
             right: false,
         });
         x += dir_w + 1;
+    }
+    if want_proc {
+        cols.push(Col {
+            lab: "PROC",
+            x,
+            w: proc_w,
+            right: false,
+        });
+        x += proc_w + 1;
     }
     if want_kind {
         cols.push(Col {
@@ -2024,6 +2043,23 @@ fn files_box(buf: &mut Buffer, area: Rect, app: &App, wide: bool) {
                 y,
                 &crate::ui::format::pad_right(&tail_path(&r.dir, cw as usize), cw as usize),
                 p::dim(),
+                false,
+            );
+        }
+        if let Some((cx, cw)) = col("PROC") {
+            // Dimmed when no byte rate corroborates the holder, the same
+            // signal the Hot Files tab uses.
+            let (text, colour) = match &r.owner {
+                Some(o) if o.total_bps() > 0.0 => (o.label(cw as usize), p::fg()),
+                Some(o) => (o.label(cw as usize), p::dim()),
+                None => ("—".to_string(), p::faint()),
+            };
+            br::text(
+                buf,
+                inner.x + cx,
+                y,
+                &crate::ui::format::pad_right(&text, cw as usize),
+                colour,
                 false,
             );
         }

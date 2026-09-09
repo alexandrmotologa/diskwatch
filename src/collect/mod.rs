@@ -3,6 +3,7 @@ pub mod filesystems;
 pub mod growth;
 pub mod hot_files;
 pub mod io;
+pub mod processes;
 pub mod smart;
 pub mod volumes;
 
@@ -19,5 +20,6 @@ pub use devices::{DeviceKind, DeviceTick};
 pub use filesystems::FsTick;
 pub use growth::GrowthTracker;
 pub use io::{DeviceHistory, IoCollector, IoTick};
+pub use processes::{ProcessCollector, ProcessTick};
 pub use smart::SmartCollector;
 pub use volumes::VolumeTick;

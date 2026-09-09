@@ -22,11 +22,18 @@
 //! burns in.
 //!
 //! ## What the table can honestly show
-//! The handoff specifies `PROCESS · FILE · WRITE · TOTAL · LAT`. Four of
-//! those five are not obtainable: FSEvents and inotify report *that* a
-//! path changed, carrying neither the writing process nor the byte count
-//! (see `collect::hot_files`). Rather than render four columns of `—`, we
-//! keep the geometry exactly and label the columns with what is measured.
+//! The handoff specifies `PROCESS · FILE · WRITE · TOTAL · LAT`. The byte
+//! count is still not obtainable — FSEvents and inotify report *that* a
+//! path changed, not how much (see `collect::hot_files`) — so the rate
+//! columns are labelled as event counts rather than throughput.
+//!
+//! `PROCESS` is now partly recoverable: `collect::processes` names the
+//! busiest process holding each path open. It is an inference across two
+//! sampled readings rather than a per-event pid, so the detail block says
+//! how confident it is and the prompt row reports how much of the process
+//! table was readable. The column itself appears only above the reference
+//! width, where it doesn't have to be taken out of `PATH`.
+//!
 //! Per-device latency, which is real, lives in the detail block and is
 //! labelled as device-level.
 
@@ -175,6 +182,12 @@ const W_FILE: u16 = 15;
 const W_COUNT: u16 = 10;
 const W_KIND: u16 = 7;
 const FIELD_GAP: u16 = 1;
+/// PROCESS column, present only on terminals wider than the reference
+/// grid. See [`Layout::new`].
+const W_PROC: u16 = 18;
+/// PATH's width on the 80-column reference grid, and the floor PROCESS is
+/// not allowed to push it below.
+const MIN_W_PATH: u16 = 22;
 
 // ── Footer ──────────────────────────────────────────────────────────────────
 
@@ -246,6 +259,11 @@ pub struct Layout {
     pub w_file: u16,
     pub x_path: u16,
     pub w_path: u16,
+    /// `None` at the reference size. Lite's 80×24 grid is locked
+    /// character-for-character, and PROCESS is 18 columns wide — taking
+    /// them from PATH there would leave four, which identifies nothing.
+    /// On anything wider it takes its own column out of the slack.
+    pub x_proc: Option<u16>,
     pub x_rate: u16,
     pub x_total: u16,
     pub x_kind: u16,
@@ -284,7 +302,18 @@ impl Layout {
         // Left-anchored, with PATH taking whatever is left in the middle.
         let x_file = content_x;
         let x_path = x_file + W_FILE + FIELD_GAP;
-        let w_path = x_rate.saturating_sub(FIELD_GAP).saturating_sub(x_path);
+        let slack = x_rate.saturating_sub(FIELD_GAP).saturating_sub(x_path);
+        // PROCESS is affordable only once PATH keeps at least the width it
+        // has on the reference grid, so widening the terminal adds the
+        // column without ever narrowing what was already there.
+        let (x_proc, w_path) = if slack >= MIN_W_PATH + W_PROC + FIELD_GAP {
+            (
+                Some(x_rate - FIELD_GAP - W_PROC),
+                slack - W_PROC - FIELD_GAP,
+            )
+        } else {
+            (None, slack)
+        };
 
         let row_footer = area.y + area.height - 1;
         let row_prompt = row_footer - 1;
@@ -297,6 +326,7 @@ impl Layout {
             w_file: W_FILE,
             x_path,
             w_path,
+            x_proc,
             x_rate,
             x_total,
             x_kind,
@@ -348,6 +378,10 @@ pub struct HotRow {
     /// Readings ever pushed — lets a sparkline group them by absolute index
     /// rather than by ring position. See `FileActivity::pushed`.
     pub pushed: u64,
+    /// Busiest process holding this path open, if we could see one. An
+    /// inference across two sampled readings, not a per-event pid — see
+    /// `collect::processes` for what it is worth.
+    pub owner: Option<crate::collect::ProcessTick>,
 }
 
 /// Snapshot the watcher into display rows, sorted by activity.
@@ -386,6 +420,7 @@ pub fn collect_rows(app: &App) -> Vec<HotRow> {
                 secs_since_seen: now.duration_since(a.last_seen).as_secs(),
                 history: a.history.iter().copied().collect(),
                 pushed: a.pushed,
+                owner: app.processes.likely_owner(&a.path).cloned(),
             }
         })
         .collect();
@@ -1007,6 +1042,9 @@ fn render_table(f: &mut Frame, app: &App, l: &Layout, paused: bool) {
 
     put(f, l.x_file, ROW_TABLE_HEAD, "FILE", head, end);
     put(f, l.x_path, ROW_TABLE_HEAD, "PATH", head, end);
+    if let Some(x) = l.x_proc {
+        put(f, x, ROW_TABLE_HEAD, "PROCESS", head, end);
+    }
     put_right(f, l.x_rate + W_COUNT - 1, ROW_TABLE_HEAD, "EV/S", head);
     put_right(f, l.x_total + W_COUNT - 1, ROW_TABLE_HEAD, "EVENTS", head);
     put_right(f, l.x_kind + W_KIND - 1, ROW_TABLE_HEAD, "KIND", head);
@@ -1099,6 +1137,19 @@ fn render_table(f: &mut Frame, app: &App, l: &Layout, paused: bool) {
             secondary,
             end,
         );
+        if let Some(x) = l.x_proc {
+            // A holder with no measurable byte rate is dimmed rather than
+            // hidden: it is still the best answer, just uncorroborated.
+            let (text, style) = match &row.owner {
+                Some(o) if o.total_bps() > 0.0 => (
+                    o.label(W_PROC as usize),
+                    Style::default().fg(if selected { p::fg() } else { p::cyan() }),
+                ),
+                Some(o) => (o.label(W_PROC as usize), secondary),
+                None => ("—".to_string(), Style::default().fg(p::faint())),
+            };
+            put(f, x, y, &truncate_end(&text, W_PROC), style, end);
+        }
         put_right(
             f,
             l.x_rate + W_COUNT - 1,
@@ -1186,6 +1237,32 @@ fn render_detail(f: &mut Frame, app: &App, l: &Layout, row: &HotRow, y: &mut u16
     );
     *y += 1;
 
+    // The detail block carries the owner at every width, including the
+    // reference grid where the PROCESS column doesn't fit. It is also the
+    // only place with room to say how confident the attribution is.
+    let owner_line = match &row.owner {
+        Some(o) if o.total_bps() > 0.0 => format!(
+            "process {} ({})   {}   holds this file open",
+            o.name,
+            o.pid,
+            crate::ui::format::fmt_rate_compact(o.total_bps())
+        ),
+        Some(o) => format!(
+            "process {} ({})   holds this file open, no measurable IO",
+            o.name, o.pid
+        ),
+        None => "process unattributed — no visible holder, sampled every 2s".to_string(),
+    };
+    put(
+        f,
+        l.content_x + 5,
+        *y,
+        &truncate_end(&owner_line, l.content_w),
+        dim,
+        end,
+    );
+    *y += 1;
+
     // Latency is per *device*, not per file — FSEvents/inotify carry no
     // per-file timing. Label it as such rather than implying otherwise.
     let lat = app
@@ -1262,16 +1339,24 @@ fn render_prompt(f: &mut Frame, app: &App, l: &Layout, matched: usize) {
     }
 
     // Say what the numbers are, because they are not what a reader of the
-    // full tool's Hot Files tab might assume. FSEvents and inotify report
-    // that a path changed, not who wrote it or how many bytes.
+    // full tool's Hot Files tab might assume. The rates are event counts;
+    // the process is inferred from who holds the path open, and how much
+    // of the process table we can see depends on privileges.
+    let cov = app.processes.coverage();
+    let note = if cov.is_partial() {
+        format!(
+            "file events, not bytes — {} of {} processes hidden, run as root",
+            cov.hidden,
+            cov.total()
+        )
+    } else {
+        "file events, not bytes — process is the busiest holder of the path".to_string()
+    };
     put(
         f,
         l.content_x,
         l.row_prompt,
-        &truncate_end(
-            "file events, not bytes — process attribution needs elevated privileges",
-            l.content_w,
-        ),
+        &truncate_end(&note, l.content_w),
         Style::default().fg(p::faint()),
         end,
     );
@@ -1469,6 +1554,43 @@ mod tests {
         assert_eq!(fmt_days(1.2), "1 day");
         assert_eq!(fmt_days(0.5), "12h");
         assert_eq!(fmt_days(0.01), "<1h");
+    }
+
+    /// The reference grid is locked character-for-character, and PROCESS
+    /// is 18 columns wide. Taking them from PATH at 80 would leave four,
+    /// which identifies nothing — so the column has to be absent there.
+    #[test]
+    fn the_process_column_is_absent_at_the_reference_width() {
+        let l = Layout::new(Rect::new(0, 0, GRID_W, GRID_H));
+        assert!(l.x_proc.is_none());
+        assert_eq!(l.w_path, MIN_W_PATH, "PATH keeps its full reference width");
+    }
+
+    /// Widening the terminal must only ever add the column, never take
+    /// width back off PATH to pay for it.
+    #[test]
+    fn a_wider_terminal_gains_the_column_without_narrowing_the_path() {
+        let mut seen_with = false;
+        let mut seen_without = false;
+        for w in GRID_W..200 {
+            let l = Layout::new(Rect::new(0, 0, w, GRID_H));
+            assert!(
+                l.w_path >= MIN_W_PATH,
+                "PATH fell to {} at {w} cols",
+                l.w_path
+            );
+            match l.x_proc {
+                Some(x) => {
+                    seen_with = true;
+                    // The column must sit between PATH and EV/S, with its
+                    // own gap on each side.
+                    assert!(x >= l.x_path + l.w_path + FIELD_GAP, "overlaps PATH at {w}");
+                    assert!(x + W_PROC + FIELD_GAP <= l.x_rate, "overlaps EV/S at {w}");
+                }
+                None => seen_without = true,
+            }
+        }
+        assert!(seen_without && seen_with, "both sides of the threshold");
     }
 
     #[test]

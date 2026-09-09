@@ -231,6 +231,10 @@ pub struct App {
     pub io: collect::IoCollector,
     pub smart: collect::SmartCollector,
     pub hot_files: collect::hot_files::HotFileWatcher,
+    /// Who is doing the IO. Crossed with `hot_files` to name a process
+    /// per path; see `collect::processes` for what that inference is and
+    /// is not worth.
+    pub processes: collect::ProcessCollector,
     /// Per-mount capacity trend. Feeds Lite's growth + time-to-full.
     pub growth: collect::GrowthTracker,
     pub insights: Vec<crate::insights::Insight>,
@@ -315,6 +319,7 @@ impl App {
             io,
             smart,
             hot_files,
+            processes: collect::ProcessCollector::new(),
             growth: collect::GrowthTracker::new(),
             insights: Vec::new(),
             last_metadata_refresh: Instant::now(),
@@ -341,6 +346,9 @@ impl App {
         // percentile window. The collector rate-limits internally, so
         // calling every frame is fine.
         self.io.sample();
+        // Rate-limited internally (1 Hz rates, 2 Hz-halved fd scan), so
+        // this is a cheap no-op on most frames.
+        self.processes.refresh();
 
         // Slower path: sysinfo-only — used bytes + mounts list at 1Hz.
         let usage_elapsed = self.last_usage_refresh.elapsed();
