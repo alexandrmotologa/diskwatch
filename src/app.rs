@@ -257,6 +257,11 @@ pub struct App {
     pub insights: Vec<crate::insights::Insight>,
     pub selected_device: usize,
     pub selected_fs: usize,
+    /// Cursor into the Full-view Hot Files table — its own list, separate
+    /// from the device/filesystem pickers.
+    pub hot_selected: usize,
+    /// First row of that list currently on screen.
+    pub hot_offset: usize,
     /// Last full enumeration (slow path — system_profiler + diskutil).
     last_metadata_refresh: Instant,
     /// Last usage refresh (fast path — sysinfo only).
@@ -333,6 +338,8 @@ impl App {
             host: read_host(devices.len()),
             selected_device: 0,
             selected_fs: 0,
+            hot_selected: 0,
+            hot_offset: 0,
             devices,
             filesystems,
             volumes,
@@ -570,13 +577,23 @@ fn handle_key(app: &mut App, key: KeyCode) {
         KeyCode::BackTab => cycle_tab(app, -1),
         KeyCode::Tab => cycle_tab(app, 1),
 
-        // Device / fs / volume selectors. All four arrow keys AND
-        // h/j/k/l work on every tab that exposes a picker (Devices,
-        // SMART, FS, Volumes, Overview's device summary). Left/Right
-        // also cycle tabs on tabs that have no picker (IO, Insights,
-        // Hot Files), so users never get a "dead" arrow key.
-        KeyCode::Up | KeyCode::Char('k') => move_selection(app, -1, 0),
-        KeyCode::Down | KeyCode::Char('j') => move_selection(app, 1, 0),
+        // Device / fs / volume selectors. All four arrow keys AND h/j/k/l
+        // work on every tab that exposes a picker (Devices, SMART, FS,
+        // Overview's device summary), plus Up/Down/Home/End/PageUp/PageDown
+        // on Hot Files' own list. Left/Right cycle tabs everywhere else
+        // (IO, Insights, Volumes, Hot Files), so users never get a "dead"
+        // arrow key — and, just as important, never one that silently moves
+        // a selection on a tab that isn't showing it (see `has_selection`).
+        KeyCode::Up | KeyCode::Char('k') => {
+            if has_selection(app) {
+                move_selection(app, -1, 0);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if has_selection(app) {
+                move_selection(app, 1, 0);
+            }
+        }
         KeyCode::Left | KeyCode::Char('h') => {
             if picker_active(app) {
                 move_selection(app, -1, 0);
@@ -591,10 +608,26 @@ fn handle_key(app: &mut App, key: KeyCode) {
                 cycle_tab(app, 1);
             }
         }
-        KeyCode::Home => move_selection(app, 0, -1),
-        KeyCode::End => move_selection(app, 0, 1),
-        KeyCode::PageUp => move_selection(app, -5, 0),
-        KeyCode::PageDown => move_selection(app, 5, 0),
+        KeyCode::Home => {
+            if has_selection(app) {
+                move_selection(app, 0, -1);
+            }
+        }
+        KeyCode::End => {
+            if has_selection(app) {
+                move_selection(app, 0, 1);
+            }
+        }
+        KeyCode::PageUp => {
+            if has_selection(app) {
+                move_selection(app, -5, 0);
+            }
+        }
+        KeyCode::PageDown => {
+            if has_selection(app) {
+                move_selection(app, 5, 0);
+            }
+        }
 
         // Digit keys 1-9 jump directly to tabs (this is the existing
         // upstream behavior — kept identical so muscle memory works).
@@ -607,6 +640,36 @@ fn handle_key(app: &mut App, key: KeyCode) {
 
         _ => {}
     }
+
+    if app.active_tab == TabId::Hot {
+        clamp_hot_scroll(app);
+    }
+}
+
+/// Keep Hot Files' cursor inside its list and its scroll window following
+/// the cursor — the same job `clamp_dense_scroll` does for Dense's copy of
+/// this list.
+fn clamp_hot_scroll(app: &mut App) {
+    let count = app.hot_files.active_count();
+    if count == 0 {
+        app.hot_selected = 0;
+        app.hot_offset = 0;
+        return;
+    }
+    app.hot_selected = app.hot_selected.min(count - 1);
+    // `last_area` is the whole terminal (see `draw`); the Full-view tab body
+    // is what's left after the 1-row header, 2-row tab bar and 2-row footer
+    // in `draw_inner`'s Layout — 5 rows of chrome, mirrored here rather than
+    // threaded through as a parameter.
+    let content_h = app.last_area.height.saturating_sub(5);
+    let content = Rect::new(0, 0, app.last_area.width, content_h);
+    let visible = (tabs::hot::visible_rows(app, content) as usize).max(1);
+    if app.hot_selected < app.hot_offset {
+        app.hot_offset = app.hot_selected;
+    } else if app.hot_selected >= app.hot_offset + visible {
+        app.hot_offset = app.hot_selected + 1 - visible;
+    }
+    app.hot_offset = app.hot_offset.min(count.saturating_sub(visible.min(count)));
 }
 
 /// Lite's complete key surface.
@@ -847,19 +910,30 @@ fn clamp_lite_scroll(app: &mut App, count: usize, visible: u16) {
     lite.offset = lite.offset.min(max_offset);
 }
 
-/// True when the active tab exposes a list of items (devices,
-/// filesystems) the user navigates with arrow keys. On these tabs,
-/// ←/→ moves the cursor; on tabs without a picker, ←/→ cycles tabs.
+/// True when the active tab exposes the shared device/filesystem picker
+/// (`selected_device` / `selected_fs`) that ↑↓←→ move. On these tabs ←/→
+/// moves the cursor; everywhere else ←/→ cycles tabs.
 ///
-/// Volumes has its own picker state (selected_container /
-/// selected_array) that's managed inside tabs/volumes.rs, so it owns
-/// its own Up/Down handling — we treat it as "no picker" here so Left/
-/// Right still cycle tabs and the user never hits a dead arrow key.
+/// Volumes has no selection UI of its own yet — despite an earlier version
+/// of this comment claiming otherwise, there is no `selected_container` /
+/// `selected_array` anywhere in the codebase. Treating it as "has a picker"
+/// without one caused ↑↓ (which had no guard at all before) to silently
+/// mutate `selected_device` while on the Volumes tab, corrupting the
+/// Devices/SMART selection the next time either was opened. Volumes stays
+/// out of this list until it actually has something for arrows to move.
 fn picker_active(app: &App) -> bool {
     matches!(
         app.active_tab,
         TabId::Overview | TabId::Devices | TabId::Smart | TabId::Fs
     )
+}
+
+/// True when ↑↓ (and Home/End/PageUp/PageDown) have something to move:
+/// `picker_active`'s tabs, plus Hot Files' own list. Separate from
+/// `picker_active` because Hot Files keeps ←/→ cycling tabs rather than
+/// moving its cursor — only Overview/Devices/SMART/FS use all four arrows.
+fn has_selection(app: &App) -> bool {
+    picker_active(app) || app.active_tab == TabId::Hot
 }
 
 // Settings modal: how many rows in the dialog. Kept as a constant so
@@ -962,13 +1036,13 @@ fn handle_settings_key(app: &mut App, key: KeyCode) {
 /// for Home (first), +1 for End (last), 0 for relative step.
 /// Wraps around at the boundaries so the user can't get stuck.
 ///
-/// Volumes uses its own selection state (selected_container /
-/// selected_array) so this helper only handles the device picker and
-/// the filesystem picker, which share the same `selected_fs` /
-/// `selected_device` index pair.
+/// Only called from behind `has_selection`, so every tab it can be reached
+/// from has one of these three counters to move — there is no catch-all
+/// fallback to `selected_device` for a tab that doesn't actually use it.
 fn move_selection(app: &mut App, dy: i32, mode: i32) {
     let (cur, len) = match app.active_tab {
         TabId::Fs => (app.selected_fs, app.filesystems.len()),
+        TabId::Hot => (app.hot_selected, app.hot_files.active_count()),
         _ => (app.selected_device, app.devices.len()),
     };
     if len == 0 {
@@ -985,6 +1059,7 @@ fn move_selection(app: &mut App, dy: i32, mode: i32) {
     };
     match app.active_tab {
         TabId::Fs => app.selected_fs = next,
+        TabId::Hot => app.hot_selected = next,
         _ => app.selected_device = next,
     }
 }
@@ -1634,6 +1709,81 @@ mod tests {
         );
         // Leave the global as we found it.
         crate::ui::graph::set_fade(before);
+    }
+
+    /// The bug behind issue #13: Volumes has no selection of its own, but
+    /// Up/Down had no guard at all, so pressing them on Volumes silently
+    /// mutated `selected_device` — the very thing Devices and SMART use —
+    /// and the next visit to either tab looked broken for no visible
+    /// reason. `has_selection` now gates Up/Down the same way `picker_
+    /// active` already gated Left/Right.
+    #[test]
+    fn arrows_on_volumes_do_not_corrupt_the_device_picker() {
+        let mut app = App::new(TabId::Overview, ViewMode::Full);
+        app.active_tab = TabId::Volumes;
+        let before = app.selected_device;
+        for key in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+        ] {
+            super::handle_key(&mut app, key);
+        }
+        assert_eq!(
+            app.selected_device, before,
+            "arrows on Volumes must not touch the Devices/SMART selection"
+        );
+    }
+
+    /// Left/Right still cycle tabs from Volumes (it has no picker to move
+    /// instead) — only the unconditional Up/Down fallthrough was the bug.
+    #[test]
+    fn left_right_still_cycle_tabs_from_volumes() {
+        let mut app = App::new(TabId::Overview, ViewMode::Full);
+        app.active_tab = TabId::Volumes;
+        super::handle_key(&mut app, KeyCode::Right);
+        assert_ne!(app.active_tab, TabId::Volumes);
+    }
+
+    /// Hot Files gets its own Up/Down-scrollable selection (issue #13's
+    /// "not up or down in the file list"), while Left/Right keep cycling
+    /// tabs there, matching IO and Insights.
+    #[test]
+    fn hot_files_up_down_move_its_own_selection() {
+        let mut app = App::new(TabId::Overview, ViewMode::Full);
+        app.active_tab = TabId::Hot;
+        // Give the watcher something to select among.
+        {
+            let mut s = app.hot_files.state.lock().unwrap();
+            for i in 0..5 {
+                s.activity.insert(
+                    std::path::PathBuf::from(format!("/tmp/f{i}")),
+                    crate::collect::hot_files::FileActivity {
+                        path: std::path::PathBuf::from(format!("/tmp/f{i}")),
+                        events_per_sec: (5 - i) as f64,
+                        total_events: 1,
+                        last_kind: crate::collect::hot_files::ActivityKind::Modified,
+                        last_seen: std::time::Instant::now(),
+                        history: std::collections::VecDeque::new(),
+                        pushed: 0,
+                    },
+                );
+            }
+        }
+        assert_eq!(app.hot_selected, 0);
+        super::handle_key(&mut app, KeyCode::Down);
+        assert_eq!(
+            app.hot_selected, 1,
+            "Down should move Hot Files' own cursor"
+        );
+
+        let before_tab = app.active_tab;
+        super::handle_key(&mut app, KeyCode::Right);
+        assert_ne!(
+            app.active_tab, before_tab,
+            "Left/Right still cycle tabs from Hot Files, unlike Overview/Devices/SMART/FS"
+        );
     }
 
     /// The overlay is where someone goes to change a setting, so it has to

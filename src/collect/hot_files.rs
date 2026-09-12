@@ -261,6 +261,13 @@ impl HotFileWatcher {
         let s = self.state.lock().unwrap();
         (s.total_events, s.watch_roots.clone(), s.error.clone())
     }
+
+    /// Total tracked paths, regardless of how many a caller will actually
+    /// render — `top` truncates to a page size, and scrolling needs the
+    /// real count to clamp against.
+    pub fn active_count(&self) -> usize {
+        self.state.lock().unwrap().activity.len()
+    }
 }
 
 /// Sensible default roots that show real user activity without drowning
