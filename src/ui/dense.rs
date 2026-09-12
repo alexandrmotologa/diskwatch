@@ -106,6 +106,39 @@ pub struct DenseState {
     pub filter_input: bool,
     pub filter_text: String,
     pub sort: FileSort,
+    /// The box currently filling the whole screen, if any — btop's zoom.
+    /// Toggled by the box's own number key; `Esc` clears it before falling
+    /// through to whatever `Esc` does next.
+    pub zoomed: Option<DenseBox>,
+}
+
+/// Which box, if any, is zoomed to fill the screen. Numbered to match the
+/// digit each box already shows in its own border — `1` through `6`, left
+/// to right, top to bottom in the six-box grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenseBox {
+    Io,
+    Devices,
+    Latency,
+    Volumes,
+    Smart,
+    Files,
+}
+
+impl DenseBox {
+    /// Resolve the key that zooms this box — the same digit its border
+    /// already shows, so there is nothing new to learn.
+    pub fn from_digit(c: char) -> Option<Self> {
+        match c {
+            '1' => Some(DenseBox::Io),
+            '2' => Some(DenseBox::Devices),
+            '3' => Some(DenseBox::Latency),
+            '4' => Some(DenseBox::Volumes),
+            '5' => Some(DenseBox::Smart),
+            '6' => Some(DenseBox::Files),
+            _ => None,
+        }
+    }
 }
 
 // ── derivations ────────────────────────────────────────────────────────────
@@ -522,10 +555,35 @@ pub const MIN_FULL_H: u16 = 32;
 pub const MIN_W: u16 = 60;
 pub const MIN_H: u16 = 16;
 
+/// Rows the read graph gets for a box of this height; the write graph gets
+/// one fewer.
+///
+/// Only used by the six-box grid: `io`'s box there is deliberately sized
+/// small and fixed (2-3 graph rows) because five other boxes need the rest
+/// of the screen — "files absorbs the slack", not io. See
+/// [`read_rows_to_fill`] for the zoomed case, where io *is* the whole
+/// screen and should use it.
+fn read_rows_for(height: u16) -> u16 {
+    if height >= 40 {
+        4
+    } else {
+        3
+    }
+}
+
+/// Read/write rows that make the io box's content exactly fill a box of
+/// this height, for when it's zoomed to the whole screen instead of sharing
+/// the grid. Inverts the io box's own height formula (2 borders + read
+/// headline + read rows + axis + write rows + write headline + vitals =
+/// `2 * read_rows + 5`) rather than duplicating it.
+fn read_rows_to_fill(height: u16) -> u16 {
+    (height.saturating_sub(5) / 2).max(1)
+}
+
 impl Layout {
     pub fn new(area: Rect) -> Self {
         // io = borders + read rows + axis + write rows + two headlines + vitals.
-        let read_rows: u16 = if area.height >= 40 { 4 } else { 3 };
+        let read_rows: u16 = read_rows_for(area.height);
         let io_h = 2 + 1 + read_rows + 1 + (read_rows - 1) + 1 + 1;
         let mid_h: u16 = 12.min(area.height / 4).max(8);
         let low_h: u16 = 8.min(area.height / 5).max(6);
@@ -552,8 +610,14 @@ impl Layout {
     }
 }
 
-/// Rows the file list can show at `area`, whichever layout that area selects.
-pub fn visible_files(area: Rect) -> u16 {
+/// Rows the file list can show at `area`, whichever layout that area
+/// selects — or the whole area, less the box's own chrome, when Files is
+/// zoomed and `files_box` is drawing into all of it instead of its usual
+/// slice of the grid.
+pub fn visible_files(app: &App, area: Rect) -> u16 {
+    if app.dense.zoomed == Some(DenseBox::Files) {
+        return area.height.saturating_sub(3);
+    }
     if area.width >= MIN_FULL_W && area.height >= MIN_FULL_H {
         Layout::new(area).visible_files()
     } else {
@@ -586,10 +650,30 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
+    if let Some(zoomed) = app.dense.zoomed {
+        render_zoomed(buf, area, app, zoomed);
+        return;
+    }
     if area.width >= MIN_FULL_W && area.height >= MIN_FULL_H {
         render_full(buf, area, app);
     } else {
         render_compact(buf, area, app);
+    }
+}
+
+/// One box, filling `area` entirely — btop's zoom. Bypasses the full/compact
+/// split on purpose: a zoomed box gets the whole terminal's width even below
+/// `MIN_FULL_W`, which is the point — devices/latency/volumes/smart are
+/// otherwise invisible on anything narrower than 104 columns.
+fn render_zoomed(buf: &mut Buffer, area: Rect, app: &App, zoomed: DenseBox) {
+    let s = sys(app);
+    match zoomed {
+        DenseBox::Io => io_box(buf, area, app, &s, read_rows_to_fill(area.height)),
+        DenseBox::Devices => devices_box(buf, area, app, &s),
+        DenseBox::Latency => latency_box(buf, area, &s),
+        DenseBox::Volumes => volumes_box(buf, area, app),
+        DenseBox::Smart => smart_box(buf, area, app),
+        DenseBox::Files => files_box(buf, area, app, true),
     }
 }
 
@@ -1423,10 +1507,15 @@ fn vol_rows(app: &App) -> Vec<VolRow> {
             }
         })
         .collect();
+    // Round to whole percent before comparing, and break ties by mount name.
+    // Sorting on the raw fraction reorders the list on every refresh: two
+    // volumes a tenth of a percent apart swap places back and forth as
+    // ordinary cache/tmp churn nudges each one, even though neither has
+    // meaningfully changed.
     rows.sort_by(|a, b| {
-        b.frac
-            .partial_cmp(&a.frac)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let pa = (a.frac * 100.0).round() as i64;
+        let pb = (b.frac * 100.0).round() as i64;
+        pb.cmp(&pa).then_with(|| a.mount.cmp(&b.mount))
     });
     rows
 }
@@ -2375,6 +2464,46 @@ mod tests {
     }
 
     #[test]
+    fn volumes_a_tenth_of_a_percent_apart_do_not_swap_order() {
+        // Sorting on the raw fraction would flip these two every time
+        // ordinary cache/tmp churn nudges either one by a fraction of a
+        // percent — the "volumes keep changing place" symptom.
+        use crate::app::{App, ViewMode};
+        use crate::collect::filesystems::FsTick;
+        use crate::tabs::TabId;
+
+        let fs = |mount: &str, used: u64, size: u64| FsTick {
+            mount: mount.to_string(),
+            device: "dev".to_string(),
+            fs_type: "ext4".to_string(),
+            size_bytes: size,
+            used_bytes: used,
+            avail_bytes: size - used,
+            inode_pct: None,
+            is_removable: false,
+            is_system: false,
+        };
+
+        let mut app = App::new_for_test(TabId::Overview, ViewMode::Dense);
+        app.filesystems = vec![
+            fs("/data", 60_001, 100_000),
+            fs("/home", 60_000, 100_000),
+        ];
+        let order_a: Vec<String> = vol_rows(&app).into_iter().map(|r| r.mount).collect();
+
+        // Same whole-percent bucket (60%), tiny jitter within it.
+        app.filesystems = vec![
+            fs("/data", 59_999, 100_000),
+            fs("/home", 60_002, 100_000),
+        ];
+        let order_b: Vec<String> = vol_rows(&app).into_iter().map(|r| r.mount).collect();
+
+        assert_eq!(order_a, order_b, "order flipped on sub-percent jitter");
+        // And it's deterministic — the tie breaks alphabetically by mount.
+        assert_eq!(order_a, vec!["/data", "/home"]);
+    }
+
+    #[test]
     fn a_sparkline_scrolls_instead_of_re_grouping() {
         // The jank this pins, and the reason `pushed` exists. Grouping samples
         // by their position in the ring re-groups all of them the moment one
@@ -2541,6 +2670,71 @@ mod tests {
                 assert!(l.visible_files() >= 1);
             }
         }
+    }
+
+    #[test]
+    fn visible_files_uses_the_whole_area_once_files_is_zoomed() {
+        use crate::app::{App, ViewMode};
+        use crate::tabs::TabId;
+
+        let mut app = App::new_for_test(TabId::Overview, ViewMode::Dense);
+        let area = Rect::new(0, 0, 80, 24);
+
+        let unzoomed = visible_files(&app, area);
+        app.dense.zoomed = Some(DenseBox::Files);
+        let zoomed = visible_files(&app, area);
+
+        assert_eq!(zoomed, area.height.saturating_sub(3));
+        assert!(
+            zoomed > unzoomed,
+            "zoomed ({zoomed}) should show more rows than the grid's files \
+             slice ({unzoomed}) at the same terminal size"
+        );
+    }
+
+    #[test]
+    fn zooming_a_box_replaces_the_whole_grid_with_it() {
+        // The point of zoom: below MIN_FULL_W the grid never shows devices at
+        // all (render_compact only draws io + files) — zoom has to reach it
+        // anyway, on the theory that any box's own layout logic already
+        // copes with an arbitrary width.
+        use crate::app::{App, ViewMode};
+        use crate::tabs::TabId;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new_for_test(TabId::Overview, ViewMode::Dense);
+        app.dense.zoomed = Some(DenseBox::Devices);
+        let (w, h) = (80, 24);
+        assert!(
+            w < MIN_FULL_W,
+            "this has to be below the six-box grid's floor to prove the point"
+        );
+
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::app::draw_for_test(f, &mut app))
+            .expect("draw");
+        let buf = term.backend().buffer();
+
+        // The devices box's own key marker sits in its top border; io's must
+        // not appear anywhere, since nothing but devices is drawn.
+        let top: String = (0..w).map(|x| buf.cell((x, 0)).unwrap().symbol()).collect();
+        assert!(
+            top.contains("┤2├"),
+            "devices' own key should be on screen: {top:?}"
+        );
+        // Row-major, so a horizontally-adjacent title string like "┤ io ├"
+        // stays contiguous in the flattened text instead of being sliced
+        // apart by column-major ordering.
+        let whole: String = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| buf.cell((x, y)).unwrap().symbol().to_string())
+            .collect();
+        assert!(
+            !whole.contains("┤ io ├"),
+            "io's own title should not be drawn at all"
+        );
     }
 
     #[test]

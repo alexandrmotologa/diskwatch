@@ -87,6 +87,28 @@ pub fn cycle() -> &'static str {
     next.name()
 }
 
+/// Serializes tests (crate-wide) that mutate the process-wide graph style
+/// and restores whatever was active before. Crate-visible for the same
+/// reason `theme::exclusive_theme` is: `ui::braille`'s dispatcher also reads
+/// this global, and a second module racing this one would reintroduce the
+/// exact flake this exists to prevent.
+#[cfg(test)]
+static ACTIVE_STYLE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `f` with the process-wide style pinned to `style`, restoring
+/// whatever was active before once `f` returns.
+#[cfg(test)]
+pub(crate) fn with_style<T>(style: GraphStyle, f: impl FnOnce() -> T) -> T {
+    let _guard = ACTIVE_STYLE_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let prev = active();
+    set_by_name(style.name());
+    let out = f();
+    set_by_name(prev.name());
+    out
+}
+
 pub fn fade_enabled() -> bool {
     *FADE.read().expect("graph fade lock poisoned")
 }
@@ -206,7 +228,10 @@ fn window(data: &[f64], width: usize) -> (&[f64], usize) {
 
 // ── bars ────────────────────────────────────────────────────────────────────
 
-const BAR_GLYPHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+// `pub(crate)`: the dense view's braille module reuses this exact glyph
+// ladder so its own bars-style rendering matches this one pixel-for-pixel
+// rather than drifting into a second, slightly different "bars" look.
+pub(crate) const BAR_GLYPHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 fn render_bars(buf: &mut Buffer, area: Rect, data: &[f64], max: f64, base: Color, opts: GraphOpts) {
     let cell_w = area.width as usize;
@@ -411,20 +436,6 @@ fn render_grid(buf: &mut Buffer, area: Rect, bg: Color, defer_to_terminal: bool)
 mod tests {
     use super::*;
 
-    /// Serialises tests that mutate the process-wide style. Without it,
-    /// `cargo test`'s thread pool lets one test's `set_by_name` leak into
-    /// another's assertions.
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_style<T>(style: GraphStyle, f: impl FnOnce() -> T) -> T {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = active();
-        set_by_name(style.name());
-        let out = f();
-        set_by_name(prev.name());
-        out
-    }
-
     fn draw(style: GraphStyle, area: Rect, data: &[f64], opts: GraphOpts) -> Buffer {
         with_style(style, || {
             let mut buf = Buffer::empty(area);
@@ -612,7 +623,7 @@ mod tests {
 
     #[test]
     fn name_roundtrips_and_cycle_returns_home() {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ACTIVE_STYLE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         for n in GRAPH_STYLE_NAMES {
             assert_eq!(by_name(n).name(), *n);
         }
@@ -625,7 +636,7 @@ mod tests {
 
     #[test]
     fn zero_sized_areas_are_a_no_op() {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ACTIVE_STYLE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
         for area in [Rect::new(0, 0, 0, 2), Rect::new(0, 0, 4, 0)] {
             render(

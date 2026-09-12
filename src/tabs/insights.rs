@@ -59,13 +59,20 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         },
     );
 
-    // Each card is 6 rows tall.
-    let mut y = area.y + 2;
+    // Each card is 6 rows tall. On a healthy system there's often just one —
+    // pinning it to the top would leave most of a tall terminal blank below
+    // a single card, which reads as broken rather than calm. Centering the
+    // whole block (cards + disclaimer) in the space below the header fixes
+    // that without padding it with anything that isn't real information.
+    let content_top = area.y + 2;
     let max_y = area.y + area.height;
-    for ins in &app.insights {
-        if y + 6 > max_y {
-            break;
-        }
+    let available = max_y.saturating_sub(content_top);
+    let shown = app.insights.len().min((available / 6) as usize);
+    let disclaimer_fits = available > shown as u16 * 6;
+    let content_h = shown as u16 * 6 + u16::from(disclaimer_fits);
+
+    let mut y = content_top + (available.saturating_sub(content_h)) / 2;
+    for ins in app.insights.iter().take(shown) {
         draw_card(
             f,
             Rect {
@@ -79,7 +86,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         y += 6;
     }
 
-    if y < max_y {
+    if disclaimer_fits {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "  Insights are read-only suggestions   they never modify devices, volumes, or filesystems.",

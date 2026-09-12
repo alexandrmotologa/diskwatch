@@ -54,6 +54,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "view",
     "tab",
     "smart_interval_secs",
+    "refresh_interval_ms",
     "temp_unit",
     "columns",
     "watch_paths",
@@ -81,6 +82,7 @@ pub struct Config {
     pub view: Option<ViewMode>,
     pub tab: Option<TabId>,
     pub smart_interval_secs: Option<u64>,
+    pub refresh_interval_ms: Option<u64>,
     pub temp_unit: Option<TempUnit>,
     pub columns: Option<VisibleColumns>,
     /// Replaces [`crate::collect::hot_files::default_roots`] outright.
@@ -205,6 +207,20 @@ impl Config {
                 ),
                 None => self.warn(line, &format!("`{key}` expects a positive integer")),
             },
+            "refresh_interval_ms" => match parse_int(value) {
+                Some(n) if n >= crate::app::MIN_REFRESH_INTERVAL_MS => {
+                    self.refresh_interval_ms = Some(n)
+                }
+                Some(n) => self.warn(
+                    line,
+                    &format!(
+                        "`{key}` = {n} is below the {}ms floor; refreshing faster than \
+                         that re-polls sysinfo for no benefit",
+                        crate::app::MIN_REFRESH_INTERVAL_MS
+                    ),
+                ),
+                None => self.warn(line, &format!("`{key}` expects a positive integer")),
+            },
             "temp_unit" => match parse_string(value).as_deref().map(str::to_ascii_lowercase) {
                 Some(v) => match v.as_str() {
                     "c" | "celsius" => self.temp_unit = Some(TempUnit::Celsius),
@@ -304,6 +320,13 @@ pub fn default_file_contents() -> String {
          # more than one smartctl subprocess per second per disk.\n\
          smart_interval_secs = {}\n\
          \n\
+         # How often on-screen usage figures (device %, filesystem/volume\n\
+         # tables, capacity trends) refresh, in milliseconds. Floor is {}ms.\n\
+         # Also reachable from the settings overlay (,) as \"Refresh speed\".\n\
+         # Doesn't affect the io throughput graphs, which sample at their\n\
+         # own fixed rate regardless.\n\
+         refresh_interval_ms = {}\n\
+         \n\
          # Temperature display unit: celsius or fahrenheit. Drive firmware\n\
          # always reports Celsius; this governs the display layer only.\n\
          temp_unit = \"celsius\"\n\
@@ -329,6 +352,8 @@ pub fn default_file_contents() -> String {
         TAB_NAMES.join(", "),
         crate::app::MIN_SMART_INTERVAL_SECS,
         crate::app::DEFAULT_SMART_INTERVAL_SECS,
+        crate::app::MIN_REFRESH_INTERVAL_MS,
+        crate::app::DEFAULT_REFRESH_INTERVAL_MS,
         COLUMN_NAMES
             .iter()
             .map(|(n, _)| *n)
@@ -533,6 +558,7 @@ mod tests {
             view = "dense"
             tab = "hot"
             smart_interval_secs = 30
+            refresh_interval_ms = 2000
             temp_unit = "fahrenheit"
             columns = ["size", "temp"]
             watch_paths = ["/var/log", "/srv"]
@@ -546,6 +572,7 @@ mod tests {
         assert_eq!(cfg.view, Some(ViewMode::Dense));
         assert_eq!(cfg.tab, Some(TabId::Hot));
         assert_eq!(cfg.smart_interval_secs, Some(30));
+        assert_eq!(cfg.refresh_interval_ms, Some(2000));
         assert_eq!(cfg.temp_unit, Some(TempUnit::Fahrenheit));
         assert_eq!(
             cfg.columns,

@@ -33,6 +33,21 @@ pub const MIN_SMART_INTERVAL_SECS: u64 = 5;
 /// Step size for `+`/`-` interval nudges, in seconds.
 pub const INTERVAL_STEP_SECS: u64 = 60;
 
+/// Default cadence for refreshing on-screen usage figures — device %,
+/// filesystem/volume tables, hot-file decay. Matches the io collector's own
+/// 1Hz aggregate ring, so the two don't visibly drift apart at the default.
+///
+/// This does not touch the io throughput graphs: those sample at their own
+/// fixed rate because a graph column has a defined width in time (one
+/// second, one row of the 5Hz history), and slowing that would change what
+/// the graph means rather than just how often the screen redraws.
+pub const DEFAULT_REFRESH_INTERVAL_MS: u64 = 1000;
+/// Floor for the refresh cadence. Below this we're re-polling sysinfo
+/// faster than most of these counters actually change, for no benefit.
+pub const MIN_REFRESH_INTERVAL_MS: u64 = 250;
+/// Presets the settings overlay's Refresh speed row cycles through.
+pub const REFRESH_INTERVAL_PRESETS_MS: [u64; 5] = [250, 500, 1000, 2000, 4000];
+
 /// Everything the CLI, the environment and the config file have already
 /// agreed on by the time the TUI starts. Resolving precedence is main.rs's
 /// job; by the time an `Options` exists, every value is final.
@@ -42,6 +57,7 @@ pub struct Options {
     /// default at every terminal size.
     pub view: ViewMode,
     pub smart_interval_secs: u64,
+    pub refresh_interval_ms: u64,
     pub temp_unit: TempUnit,
     pub visible_columns: VisibleColumns,
     /// Roots for the Hot Files watcher, already resolved and expanded.
@@ -67,6 +83,7 @@ impl Options {
             start_tab,
             view,
             smart_interval_secs: DEFAULT_SMART_INTERVAL_SECS,
+            refresh_interval_ms: DEFAULT_REFRESH_INTERVAL_MS,
             temp_unit: TempUnit::Celsius,
             visible_columns: VisibleColumns(VisibleColumns::ALL),
             watch_roots: collect::hot_files::default_roots(),
@@ -250,6 +267,9 @@ pub struct App {
     /// Cached label for the footer ("+ 60s") so we don't allocate per
     /// draw frame.
     pub smart_interval_label: String,
+    /// Cadence for refreshing on-screen usage figures, in milliseconds.
+    /// Mutable at runtime from the settings overlay's Refresh speed row.
+    pub refresh_interval_ms: u64,
     /// True while the `?` help overlay is being shown.
     pub show_help: bool,
     /// True while the `,` settings overlay is being shown.
@@ -326,6 +346,7 @@ impl App {
             last_usage_refresh: Instant::now(),
             smart_interval_secs: opts.smart_interval_secs,
             smart_interval_label: format_smart_label(opts.smart_interval_secs),
+            refresh_interval_ms: opts.refresh_interval_ms,
             show_help: false,
             show_settings: false,
             settings_cursor: 0,
@@ -350,9 +371,11 @@ impl App {
         // this is a cheap no-op on most frames.
         self.processes.refresh();
 
-        // Slower path: sysinfo-only — used bytes + mounts list at 1Hz.
+        // Slower path: sysinfo-only — used bytes + mounts list. Cadence is
+        // user-configurable (Refresh speed in the settings overlay); 1Hz
+        // is only the default.
         let usage_elapsed = self.last_usage_refresh.elapsed();
-        if usage_elapsed >= Duration::from_millis(1000) {
+        if usage_elapsed >= Duration::from_millis(self.refresh_interval_ms) {
             collect::devices::refresh_usage(&mut self.devices);
             self.filesystems = collect::filesystems::collect();
             self.growth.observe(&self.filesystems);
@@ -714,7 +737,6 @@ fn handle_dense_key(app: &mut App, key: KeyCode) {
     }
 
     let count = dense::sorted_rows(app).len();
-    let visible = dense::visible_files(app.last_area);
 
     match key {
         KeyCode::Char('q') => app.should_quit = true,
@@ -746,11 +768,19 @@ fn handle_dense_key(app: &mut App, key: KeyCode) {
             app.dense.filter_text.clear();
         }
         KeyCode::Char('s') => app.dense.sort = app.dense.sort.next(),
+        // Zoom a box to fill the screen — the same digit its border already
+        // shows. Pressing the zoomed box's own key again restores the grid.
+        KeyCode::Char(c) if dense::DenseBox::from_digit(c).is_some() => {
+            let b = dense::DenseBox::from_digit(c);
+            app.dense.zoomed = if app.dense.zoomed == b { None } else { b };
+        }
         KeyCode::Esc => {
             if !app.dense.filter_text.is_empty() {
                 app.dense.filter_text.clear();
                 app.dense.selected = 0;
                 app.dense.offset = 0;
+            } else if app.dense.zoomed.is_some() {
+                app.dense.zoomed = None;
             } else {
                 app.should_quit = true;
             }
@@ -766,6 +796,9 @@ fn handle_dense_key(app: &mut App, key: KeyCode) {
         _ => {}
     }
 
+    // Computed after the match so a zoom toggled by this same keypress is
+    // already reflected — zooming into Files changes how many rows fit.
+    let visible = dense::visible_files(app, app.last_area);
     clamp_dense_scroll(app, count, visible);
 }
 
@@ -831,7 +864,7 @@ fn picker_active(app: &App) -> bool {
 
 // Settings modal: how many rows in the dialog. Kept as a constant so
 // `handle_settings_key` and `draw_settings_overlay` agree on the bounds.
-const SETTINGS_ROWS: usize = 11;
+const SETTINGS_ROWS: usize = 12;
 // Below this index, rows are toggles (column visibility bitflags);
 // at or above, rows are cycle setters (temp unit, SMART interval, theme).
 const SETTINGS_FIRST_CYCLE: usize = 5;
@@ -882,6 +915,22 @@ fn handle_settings_key(app: &mut App, key: KeyCode) {
                     app.smart_refresh_requested = true;
                 }
                 7 => {
+                    // Cycle the refresh cadence through the presets,
+                    // wrapping. Governs how often on-screen usage figures
+                    // (device %, filesystem/volume tables) refresh — the io
+                    // throughput graphs sample at their own fixed rate
+                    // regardless, since a graph column has a defined width
+                    // in time and slowing that would change what the graph
+                    // means, not just how often the screen redraws.
+                    let current = app.refresh_interval_ms;
+                    let next = REFRESH_INTERVAL_PRESETS_MS
+                        .iter()
+                        .find(|&&p| p > current)
+                        .copied()
+                        .unwrap_or(REFRESH_INTERVAL_PRESETS_MS[0]);
+                    app.refresh_interval_ms = next;
+                }
+                8 => {
                     // Theme lives in a global rather than on App, so the
                     // palette accessors can read it without threading a
                     // reference through every render fn. Nothing to store
@@ -892,13 +941,13 @@ fn handle_settings_key(app: &mut App, key: KeyCode) {
                 // the views through the menu rather than the keybinding.
                 // The overlay stays open across the switch, so the next
                 // press keeps cycling and you can see each view behind it.
-                8 => cycle_view(app),
+                9 => cycle_view(app),
                 // Graph style and fade live in the same kind of global as
                 // the theme, for the same reason.
-                9 => {
+                10 => {
                     crate::ui::graph::cycle();
                 }
-                10 => {
+                11 => {
                     crate::ui::graph::toggle_fade();
                 }
                 _ => {}
@@ -957,6 +1006,19 @@ fn format_smart_label(secs: u64) -> String {
         format!("{}m", secs / 60)
     } else {
         format!("{}h", secs / 3600)
+    }
+}
+
+/// "250ms", "1s", "1.5s" — whichever reads more naturally at that size.
+fn format_refresh_label(ms: u64) -> String {
+    if ms < 1000 {
+        return format!("{ms}ms");
+    }
+    let secs = ms as f64 / 1000.0;
+    if ms % 1000 == 0 {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{secs:.1}s")
     }
 }
 
@@ -1218,7 +1280,7 @@ fn draw_dense_help_overlay(f: &mut ratatui::Frame, area: Rect) {
         return;
     }
     let popup_w = 62u16.min(area.width.saturating_sub(4));
-    let popup_h = 16u16.min(area.height.saturating_sub(4));
+    let popup_h = 17u16.min(area.height.saturating_sub(4));
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(popup_w)) / 2,
         y: area.y + (area.height.saturating_sub(popup_h)) / 2,
@@ -1254,6 +1316,10 @@ fn draw_dense_help_overlay(f: &mut ratatui::Frame, area: Rect) {
         Line::from(vec![key("/"), desc("filter by file or path")]),
         Line::from(vec![key("s"), desc("cycle sort: events / total / name")]),
         Line::from(vec![key("Home End"), desc("first / last row")]),
+        Line::from(vec![
+            key("1-6"),
+            desc("zoom the matching box full-screen, again to restore"),
+        ]),
         Line::from(""),
         Line::from(vec![key("p"), desc("pause / resume")]),
         Line::from(vec![key("V"), desc("cycle view: full → lite → dense")]),
@@ -1341,6 +1407,10 @@ fn settings_rows(app: &App) -> Vec<(&'static str, String)> {
             // rendered as "(r refreshes n". Same constraint as the Theme
             // and Graph fade rows below.
             format!("{} (r refreshes)", app.smart_interval_label),
+        ),
+        (
+            "Refresh speed",
+            format_refresh_label(app.refresh_interval_ms),
         ),
         (
             // Value stays a bare name: the popup is 60 cols and the row
@@ -1798,6 +1868,42 @@ mod tests {
         let before = app.dense.sort;
         super::handle_key(&mut app, KeyCode::Char('s'));
         assert_ne!(app.dense.sort, before);
+    }
+
+    #[test]
+    fn a_box_number_zooms_it_and_pressing_it_again_restores_the_grid() {
+        use crate::ui::dense::DenseBox;
+
+        let mut app = App::new(TabId::Overview, ViewMode::Dense);
+        assert_eq!(app.dense.zoomed, None);
+
+        super::handle_key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.dense.zoomed, Some(DenseBox::Volumes));
+
+        // A different digit switches zoom to that box rather than stacking.
+        super::handle_key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.dense.zoomed, Some(DenseBox::Io));
+
+        // The zoomed box's own key again restores the grid.
+        super::handle_key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.dense.zoomed, None);
+    }
+
+    #[test]
+    fn esc_clears_zoom_before_it_would_otherwise_quit() {
+        use crate::ui::dense::DenseBox;
+
+        let mut app = App::new(TabId::Overview, ViewMode::Dense);
+        super::handle_key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.dense.zoomed, Some(DenseBox::Devices));
+
+        super::handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.dense.zoomed, None, "Esc should un-zoom first");
+        assert!(!app.should_quit, "and not also quit in the same press");
+
+        // With nothing left to unwind, Esc falls through to quit as usual.
+        super::handle_key(&mut app, KeyCode::Esc);
+        assert!(app.should_quit);
     }
 
     #[test]

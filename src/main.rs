@@ -137,6 +137,7 @@ struct Resolved {
     view: ViewMode,
     tab: TabId,
     smart_interval_secs: u64,
+    refresh_interval_ms: u64,
     temp_unit: TempUnit,
     visible_columns: VisibleColumns,
     /// Roots replacing the defaults, or `None` to keep them.
@@ -212,6 +213,9 @@ fn resolve(cli: &Cli, cfg: &Config, env_watch: Option<Vec<PathBuf>>) -> Resolved
         smart_interval_secs: cfg
             .smart_interval_secs
             .unwrap_or(app::DEFAULT_SMART_INTERVAL_SECS),
+        refresh_interval_ms: cfg
+            .refresh_interval_ms
+            .unwrap_or(app::DEFAULT_REFRESH_INTERVAL_MS),
         temp_unit: cfg.temp_unit.unwrap_or(TempUnit::Celsius),
         visible_columns: cfg.columns.unwrap_or(VisibleColumns(VisibleColumns::ALL)),
         watch_replace,
@@ -278,6 +282,7 @@ fn main() -> Result<()> {
         start_tab: r.tab,
         view: r.view,
         smart_interval_secs: r.smart_interval_secs,
+        refresh_interval_ms: r.refresh_interval_ms,
         temp_unit: r.temp_unit,
         visible_columns: r.visible_columns,
         watch_roots,
@@ -453,6 +458,7 @@ mod cli_tests {
             view: Some(ViewMode::Dense),
             tab: Some(TabId::Hot),
             smart_interval_secs: Some(30),
+            refresh_interval_ms: Some(2000),
             temp_unit: Some(TempUnit::Fahrenheit),
             columns: Some(VisibleColumns(VisibleColumns::SIZE)),
             ..Config::default()
@@ -464,6 +470,7 @@ mod cli_tests {
         assert_eq!(r.view, ViewMode::Dense);
         assert_eq!(r.tab, TabId::Hot);
         assert_eq!(r.smart_interval_secs, 30);
+        assert_eq!(r.refresh_interval_ms, 2000);
         assert_eq!(r.temp_unit, TempUnit::Fahrenheit);
         assert_eq!(r.visible_columns, VisibleColumns(VisibleColumns::SIZE));
     }

@@ -14,9 +14,17 @@
 //!
 //! The existing [`crate::ui::graph`] `dots` style is a different thing: one
 //! sample per *cell* column, coloured by horizontal position for the fade.
-//! This module is two samples per cell column, coloured by height, with a
-//! mirrored mode for the downward-growing write graph — none of which the
-//! shared module needs, and adding them there would complicate every caller.
+//! This module's braille renderer is two samples per cell column, coloured
+//! by height, with a mirrored mode for the downward-growing write graph —
+//! none of which the shared module needs, and adding them there would
+//! complicate every caller.
+//!
+//! What this module *does* share with [`crate::ui::graph`] is the style
+//! choice itself: [`graph`] dispatches on the same global `GraphStyle`
+//! everything else reads, drawing its own bars variant (see
+//! [`graph_bars`]) rather than braille when the setting is `bars`. Without
+//! that, the settings overlay's Graph style row would be a dead control
+//! whenever the dense view is on screen.
 
 #![allow(dead_code)]
 
@@ -192,6 +200,10 @@ pub fn tint(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, bg: Color) {
 ///
 /// `band` describes the range the caller's values occupy, and only matters for
 /// a single-row graph — see the note on colouring below.
+/// Entry point every dense-view graph draws through. Dispatches on the same
+/// global [`crate::ui::graph::GraphStyle`] the rest of the app reads, so the
+/// settings overlay's Graph style row controls Dense too instead of being a
+/// dead control there.
 pub fn graph(
     buf: &mut Buffer,
     area: Rect,
@@ -203,6 +215,85 @@ pub fn graph(
     if area.width == 0 || area.height == 0 {
         return;
     }
+    match crate::ui::graph::active() {
+        crate::ui::graph::GraphStyle::Bars => graph_bars(buf, area, vals, ramp, flip, band),
+        crate::ui::graph::GraphStyle::Dots => graph_braille(buf, area, vals, ramp, flip, band),
+    }
+}
+
+/// Stacked eighth-block bars — one sample per column, coloured by
+/// magnitude via `ramp`, using the same glyph ladder as
+/// [`crate::ui::graph`]'s `bars` style.
+///
+/// Two samples come in per character column (see [`graph_braille`]), and
+/// bars draws at half that density; rather than average them away, the
+/// louder of the pair wins, so a one-tick spike still shows at the same
+/// data rate the dots style renders it at.
+///
+/// The downward-growing (`flip`) side — the write half of the mirrored io
+/// graph — quantizes to whole rows instead of eighths: Unicode's block
+/// elements have all eight lower-N-eighths glyphs (▁▂▃▄▅▆▇█) but only two
+/// upper ones (▀ half, ▔ one eighth), so a smooth top-anchored ladder the
+/// same resolution as the bottom-anchored one doesn't exist as single
+/// glyphs.
+fn graph_bars(
+    buf: &mut Buffer,
+    area: Rect,
+    vals: &[f64],
+    ramp: Ramp,
+    flip: bool,
+    band: Option<(f64, f64)>,
+) {
+    let (b_lo, b_hi) = band.unwrap_or((0.0, 1.0));
+    let h = area.height as usize;
+    let sub_h = h * 8;
+
+    for cx in 0..area.width as usize {
+        let lv = vals.get(cx * 2).copied().unwrap_or(0.0).max(0.0);
+        let rv = vals.get(cx * 2 + 1).copied().unwrap_or(0.0).max(0.0);
+        let v = lv.max(rv);
+        if v <= 0.0 {
+            continue;
+        }
+        let f = ((v - b_lo) / (b_hi - b_lo).max(f64::EPSILON)).clamp(0.0, 1.0);
+        let color = ramp.at(f);
+        // Floored to at least one eighth, matching graph_braille's "any
+        // non-zero sample is visible" rule.
+        let filled = ((v.min(1.0) * sub_h as f64).round() as usize).max(1);
+
+        if flip {
+            let rows = (filled / 8).min(h);
+            for cy in 0..rows {
+                if let Some(cell) = buf.cell_mut((area.x + cx as u16, area.y + cy as u16)) {
+                    cell.set_char('█').set_fg(color);
+                }
+            }
+        } else {
+            for cy in 0..h {
+                let from_bottom = h - 1 - cy;
+                let eighths = filled.saturating_sub(from_bottom * 8).min(8);
+                if eighths == 0 {
+                    continue;
+                }
+                if let Some(cell) = buf.cell_mut((area.x + cx as u16, area.y + cy as u16)) {
+                    cell.set_char(crate::ui::graph::BAR_GLYPHS[eighths])
+                        .set_fg(color);
+                }
+            }
+        }
+    }
+}
+
+/// btop-style braille area plot: the dense view's original graph
+/// rendering, now one of two styles [`graph`] dispatches to.
+fn graph_braille(
+    buf: &mut Buffer,
+    area: Rect,
+    vals: &[f64],
+    ramp: Ramp,
+    flip: bool,
+    band: Option<(f64, f64)>,
+) {
     let (b_lo, b_hi) = band.unwrap_or((0.0, 1.0));
     let h = area.height as usize;
     let sub_h = h * 4;
@@ -632,8 +723,11 @@ mod tests {
     fn flip_mirrors_the_fill_about_the_axis() {
         // The mirrored write graph is the identity of the tool: a restore is a
         // cliff above the axis, a backup a cliff below it.
+        // Exercises the braille bit-pattern directly — the mirroring math is
+        // the same regardless of the active graph style, and calling the
+        // dispatcher here would make this test depend on global state.
         let mut up = buffer(1, 2);
-        graph(
+        graph_braille(
             &mut up,
             Rect::new(0, 0, 1, 2),
             &[0.5, 0.5],
@@ -642,7 +736,7 @@ mod tests {
             None,
         );
         let mut down = buffer(1, 2);
-        graph(
+        graph_braille(
             &mut down,
             Rect::new(0, 0, 1, 2),
             &[0.5, 0.5],
@@ -661,9 +755,83 @@ mod tests {
     fn both_sub_columns_are_filled() {
         // Lighting only the left sub-column reads as a sparse dot matrix
         // rather than an area fill — the bug netwatch shipped and fixed.
+        // Calls the braille implementation directly for the same reason as
+        // `flip_mirrors_the_fill_about_the_axis` above.
         let mut buf = buffer(1, 1);
-        spark(&mut buf, 0, 0, 1, &[1.0, 1.0], Ramp::Read, None);
+        graph_braille(
+            &mut buf,
+            Rect::new(0, 0, 1, 1),
+            &[1.0, 1.0],
+            Ramp::Read,
+            false,
+            None,
+        );
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "⣿");
+    }
+
+    #[test]
+    fn the_public_entry_point_switches_style_with_the_global_setting() {
+        // Pins the actual fix: before this, the dense view always drew
+        // braille no matter what the settings overlay's Graph style row
+        // said, because `graph()`/`spark()` never looked at it.
+        use crate::ui::graph::{with_style, GraphStyle};
+
+        let bars = with_style(GraphStyle::Bars, || {
+            let mut buf = buffer(1, 1);
+            spark(&mut buf, 0, 0, 1, &[1.0, 1.0], Ramp::Read, None);
+            buf.cell((0, 0)).unwrap().symbol().to_string()
+        });
+        assert_eq!(bars, "█", "bars style should draw a block, not braille");
+
+        let dots = with_style(GraphStyle::Dots, || {
+            let mut buf = buffer(1, 1);
+            spark(&mut buf, 0, 0, 1, &[1.0, 1.0], Ramp::Read, None);
+            buf.cell((0, 0)).unwrap().symbol().to_string()
+        });
+        assert_eq!(dots, "⣿", "dots style should draw braille");
+    }
+
+    #[test]
+    fn bars_style_mirrors_about_the_axis_at_whole_row_resolution() {
+        // Unicode has no upper-N-eighths ladder to match the lower one, so
+        // the downward-growing (flip) side quantizes to whole rows — see
+        // `graph_bars`'s doc comment. Pin that it still grows the right
+        // direction rather than silently rendering nothing.
+        use crate::ui::graph::{with_style, GraphStyle};
+
+        with_style(GraphStyle::Bars, || {
+            let mut up = buffer(1, 2);
+            graph(
+                &mut up,
+                Rect::new(0, 0, 1, 2),
+                &[1.0, 1.0],
+                Ramp::Read,
+                false,
+                None,
+            );
+            assert_eq!(up.cell((0, 1)).unwrap().symbol(), "█", "fills the bottom row");
+            assert_eq!(up.cell((0, 0)).unwrap().symbol(), "█");
+
+            let mut down = buffer(1, 2);
+            graph(
+                &mut down,
+                Rect::new(0, 0, 1, 2),
+                &[0.5, 0.5],
+                Ramp::Write,
+                true,
+                None,
+            );
+            assert_ne!(
+                down.cell((0, 0)).unwrap().symbol(),
+                " ",
+                "half-fill should light the top row growing down"
+            );
+            assert_eq!(
+                down.cell((0, 1)).unwrap().symbol(),
+                " ",
+                "and stop before the bottom row"
+            );
+        });
     }
 
     #[test]
