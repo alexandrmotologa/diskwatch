@@ -809,7 +809,11 @@ mod tests {
                 false,
                 None,
             );
-            assert_eq!(up.cell((0, 1)).unwrap().symbol(), "█", "fills the bottom row");
+            assert_eq!(
+                up.cell((0, 1)).unwrap().symbol(),
+                "█",
+                "fills the bottom row"
+            );
             assert_eq!(up.cell((0, 0)).unwrap().symbol(), "█");
 
             let mut down = buffer(1, 2);

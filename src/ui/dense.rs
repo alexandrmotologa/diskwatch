@@ -2485,17 +2485,11 @@ mod tests {
         };
 
         let mut app = App::new_for_test(TabId::Overview, ViewMode::Dense);
-        app.filesystems = vec![
-            fs("/data", 60_001, 100_000),
-            fs("/home", 60_000, 100_000),
-        ];
+        app.filesystems = vec![fs("/data", 60_001, 100_000), fs("/home", 60_000, 100_000)];
         let order_a: Vec<String> = vol_rows(&app).into_iter().map(|r| r.mount).collect();
 
         // Same whole-percent bucket (60%), tiny jitter within it.
-        app.filesystems = vec![
-            fs("/data", 59_999, 100_000),
-            fs("/home", 60_002, 100_000),
-        ];
+        app.filesystems = vec![fs("/data", 59_999, 100_000), fs("/home", 60_002, 100_000)];
         let order_b: Vec<String> = vol_rows(&app).into_iter().map(|r| r.mount).collect();
 
         assert_eq!(order_a, order_b, "order flipped on sub-percent jitter");
