@@ -281,6 +281,7 @@ fn scan_open_files() -> (HashMap<PathBuf, Vec<u32>>, Coverage) {
 /// Paths worth indexing. Sockets, pipes and anonymous inodes have no
 /// path; `/proc`, `/sys` and `/dev` have one but never appear in Hot
 /// Files, since the watcher is rooted on real directories.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 fn is_indexable(path: &Path) -> bool {
     let Some(s) = path.to_str() else {
         // A non-UTF-8 filename is legal and we keep it: the Hot Files

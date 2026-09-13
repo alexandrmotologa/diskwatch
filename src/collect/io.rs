@@ -462,11 +462,23 @@ impl IoCollector {
         {
             diskstats_totals_linux()
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            totals_windows()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             HashMap::new()
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn totals_windows() -> HashMap<String, DeviceTotals> {
+    // Windows I/O metrics: uncollected counters return an empty map,
+    // causing the TUI to cleanly display '--' while device discovery and
+    // capacity gauges run natively.
+    HashMap::new()
 }
 
 #[cfg(target_os = "macos")]

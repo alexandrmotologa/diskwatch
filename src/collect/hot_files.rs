@@ -278,6 +278,15 @@ pub fn default_roots() -> Vec<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
         roots.push(PathBuf::from(home));
     }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            roots.push(PathBuf::from(profile));
+        }
+        if let Some(temp) = std::env::var_os("TEMP") {
+            roots.push(PathBuf::from(temp));
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         roots.push(PathBuf::from("/private/var/log"));
