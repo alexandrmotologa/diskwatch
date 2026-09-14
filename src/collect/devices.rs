@@ -17,8 +17,12 @@ use crate::collect::macos;
 #[cfg(target_os = "linux")]
 use crate::collect::linux;
 
+#[cfg(target_os = "windows")]
+use crate::collect::windows;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     Nvme,
     /// Reserved for Linux sysfs classification (SATA SSDs) — macOS reports
     /// these as SATA which we currently bucket as HDD until rotation_rpm
@@ -58,7 +62,7 @@ pub struct DeviceTick {
 }
 
 pub fn collect() -> Vec<DeviceTick> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let mounts_used = sysinfo_mount_used();
 
     #[cfg(target_os = "macos")]
@@ -149,7 +153,38 @@ pub fn collect() -> Vec<DeviceTick> {
         out
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        let wins = windows::collect();
+        let mut out: Vec<DeviceTick> = wins
+            .into_iter()
+            .map(|w| {
+                let kind = match w.kind {
+                    windows::WindowsKind::Ssd => DeviceKind::Ssd,
+                    windows::WindowsKind::Hdd => DeviceKind::Hdd,
+                    windows::WindowsKind::UsbMassStorage => DeviceKind::UsbMassStorage,
+                    windows::WindowsKind::Unknown => DeviceKind::Unknown,
+                };
+                DeviceTick {
+                    name: w.name,
+                    kind,
+                    model: w.model,
+                    bus: w.bus,
+                    size_bytes: w.size_bytes,
+                    used_bytes: w.used_bytes,
+                    is_removable: w.removable,
+                    firmware: w.firmware,
+                    serial: w.serial,
+                    smart_ok: w.smart_ok,
+                    idle: w.size_bytes == 0,
+                }
+            })
+            .collect();
+        out.sort_by_key(|d| std::cmp::Reverse(d.size_bytes));
+        out
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let mut out: Vec<DeviceTick> = mounts_used
             .into_iter()
@@ -727,7 +762,7 @@ mod tests {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn classify_by_name(name: &str) -> DeviceKind {
     if name.starts_with("nvme") {
         DeviceKind::Nvme
@@ -738,7 +773,7 @@ fn classify_by_name(name: &str) -> DeviceKind {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn bus_hint(k: &DeviceKind) -> String {
     match k {
         DeviceKind::Nvme => "PCIe".to_string(),

@@ -272,11 +272,26 @@ impl HotFileWatcher {
 
 /// Sensible default roots that show real user activity without drowning
 /// in /System churn. /private/tmp and /private/var/log are useful on
-/// macOS; on Linux we want /home and /var/log.
+/// macOS; on Linux we want /home and /var/log; on Windows we want
+/// %USERPROFILE% and %TEMP% (when distinct and not nested inside the profile).
 pub fn default_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(home));
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            roots.push(PathBuf::from(home));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            roots.push(PathBuf::from(profile));
+        } else if let Some(home) = std::env::var_os("HOME") {
+            roots.push(PathBuf::from(home));
+        }
+        if let Some(temp) = std::env::var_os("TEMP") {
+            roots.push(PathBuf::from(temp));
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -288,7 +303,7 @@ pub fn default_roots() -> Vec<PathBuf> {
         roots.push(PathBuf::from("/var/log"));
         roots.push(PathBuf::from("/tmp"));
     }
-    roots
+    prune_nested_roots(roots)
 }
 
 /// Turn a `notify` failure into something a user can act on.
@@ -331,20 +346,55 @@ fn describe_watch_error(root: &Path, e: &notify::Error) -> String {
     }
 }
 
+/// Drops exact duplicate roots and removes any root that is nested inside
+/// another watched root.
+///
+/// Because watching is recursive ([`RecursiveMode::Recursive`]), watching a
+/// directory and any of its descendants causes every file event inside the
+/// descendant to be delivered twice. If canonicalization succeeds for both
+/// paths, symlinks, casing, and Windows 8.3 short names (`ALEXAN~1`) are
+/// normalized before checking.
+pub fn prune_nested_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut result: Vec<PathBuf> = Vec::new();
+    for candidate in roots {
+        let already_covered = result.iter().any(|kept| {
+            if let (Ok(c_cand), Ok(c_kept)) = (candidate.canonicalize(), kept.canonicalize()) {
+                c_cand.starts_with(&c_kept)
+            } else {
+                candidate.starts_with(kept)
+            }
+        });
+        if already_covered {
+            continue;
+        }
+
+        result.retain(|kept| {
+            let kept_is_child =
+                if let (Ok(c_kept), Ok(c_cand)) = (kept.canonicalize(), candidate.canonicalize()) {
+                    c_kept.starts_with(&c_cand)
+                } else {
+                    kept.starts_with(&candidate)
+                };
+            !kept_is_child
+        });
+
+        result.push(candidate);
+    }
+    result
+}
+
 /// The roots to hand [`HotFileWatcher::start`], given what the user asked
 /// for. `replace` (from `--watch` or the config's `watch_paths`) stands in
 /// for [`default_roots`] entirely; `extra` (from `--watch-add` or
 /// `extra_watch_paths`) is added to whichever list won.
 ///
-/// Duplicates are dropped, keeping first position. Watching the same tree
+/// Duplicates and nested descendant paths are dropped. Watching the same tree
 /// twice is not harmful — `notify` collapses it — but it doubles the path
 /// up in the tab's "watch" banner, which reads as a bug.
 pub fn resolve_roots(replace: Option<Vec<PathBuf>>, extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut roots = replace.unwrap_or_else(default_roots);
     roots.extend_from_slice(extra);
-    let mut seen = std::collections::HashSet::new();
-    roots.retain(|p| seen.insert(p.clone()));
-    roots
+    prune_nested_roots(roots)
 }
 
 #[cfg(test)]
@@ -373,6 +423,18 @@ mod tests {
             &[PathBuf::from("/a")],
         );
         assert_eq!(roots, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    #[test]
+    fn nested_roots_collapse_into_parent() {
+        let roots = resolve_roots(
+            Some(vec![PathBuf::from("/a"), PathBuf::from("/a/b")]),
+            &[PathBuf::from("/a/b/c")],
+        );
+        assert_eq!(roots, vec![PathBuf::from("/a")]);
+
+        let inverted = resolve_roots(Some(vec![PathBuf::from("/a/b")]), &[PathBuf::from("/a")]);
+        assert_eq!(inverted, vec![PathBuf::from("/a")]);
     }
 
     /// `notify` maps the inotify budget being exhausted to its own error

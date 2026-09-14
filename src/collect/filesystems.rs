@@ -55,20 +55,30 @@ pub fn collect() -> Vec<FsTick> {
 }
 
 fn is_system_mount(path: &str) -> bool {
-    matches!(
-        path,
-        "/" | "/boot"
-            | "/boot/efi"
-            | "/private/var/vm"
-            | "/System/Volumes/Data"
-            | "/System/Volumes/Preboot"
-            | "/System/Volumes/Recovery"
-            | "/System/Volumes/Update"
-            | "/System/Volumes/VM"
-            | "/System/Volumes/iSCPreboot"
-            | "/System/Volumes/Hardware"
-    ) || path.starts_with("/System/Volumes/")
-        || path.starts_with("/dev")
-        || path.starts_with("/proc")
-        || path.starts_with("/sys")
+    #[cfg(target_os = "windows")]
+    {
+        let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+        path.eq_ignore_ascii_case(&sys_drive)
+            || path.eq_ignore_ascii_case(&format!("{sys_drive}\\"))
+            || path.eq_ignore_ascii_case(&format!("{sys_drive}/"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        matches!(
+            path,
+            "/" | "/boot"
+                | "/boot/efi"
+                | "/private/var/vm"
+                | "/System/Volumes/Data"
+                | "/System/Volumes/Preboot"
+                | "/System/Volumes/Recovery"
+                | "/System/Volumes/Update"
+                | "/System/Volumes/VM"
+                | "/System/Volumes/iSCPreboot"
+                | "/System/Volumes/Hardware"
+        ) || path.starts_with("/System/Volumes/")
+            || path.starts_with("/dev")
+            || path.starts_with("/proc")
+            || path.starts_with("/sys")
+    }
 }
