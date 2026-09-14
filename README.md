@@ -125,6 +125,7 @@ Rust 1.75+.
 | Key | Action |
 |---|---|
 | `1`–`8` | Switch tabs |
+| `←` `→` `h` `l` / `Shift+Tab` `Tab` | Previous / next tab (Full view) |
 | `V` | Cycle view: full → lite → dense |
 | `L` | Jump straight to Lite |
 | `↑` `↓` `j` `k` | Move selection |

@@ -569,21 +569,12 @@ fn handle_key(app: &mut App, key: KeyCode) {
             app.smart_refresh_requested = true;
         }
 
-        // Tab cycling: Tab/BackTab always cycle. Left/Right cycle tabs
-        // ONLY on tabs that don't have a picker (IO, Insights, Hot Files)
-        // — on tabs that have a picker they move the selection (handled
-        // below). This matches user expectation: arrows in a list move
-        // the cursor; arrows in a single-pane tab cycle neighbors.
-        KeyCode::BackTab => cycle_tab(app, -1),
-        KeyCode::Tab => cycle_tab(app, 1),
+        // Horizontal keys always change tab, on every tab (issue #13).
+        // Vertical keys move the active tab's selection, if it has one.
+        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => cycle_tab(app, -1),
+        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => cycle_tab(app, 1),
 
-        // Device / fs / volume selectors. All four arrow keys AND h/j/k/l
-        // work on every tab that exposes a picker (Devices, SMART, FS,
-        // Overview's device summary), plus Up/Down/Home/End/PageUp/PageDown
-        // on Hot Files' own list. Left/Right cycle tabs everywhere else
-        // (IO, Insights, Volumes, Hot Files), so users never get a "dead"
-        // arrow key — and, just as important, never one that silently moves
-        // a selection on a tab that isn't showing it (see `has_selection`).
+        // Only move a selection when the active tab actually displays it.
         KeyCode::Up | KeyCode::Char('k') => {
             if has_selection(app) {
                 move_selection(app, -1, 0);
@@ -592,20 +583,6 @@ fn handle_key(app: &mut App, key: KeyCode) {
         KeyCode::Down | KeyCode::Char('j') => {
             if has_selection(app) {
                 move_selection(app, 1, 0);
-            }
-        }
-        KeyCode::Left | KeyCode::Char('h') => {
-            if picker_active(app) {
-                move_selection(app, -1, 0);
-            } else {
-                cycle_tab(app, -1);
-            }
-        }
-        KeyCode::Right | KeyCode::Char('l') => {
-            if picker_active(app) {
-                move_selection(app, 1, 0);
-            } else {
-                cycle_tab(app, 1);
             }
         }
         KeyCode::Home => {
@@ -910,30 +887,19 @@ fn clamp_lite_scroll(app: &mut App, count: usize, visible: u16) {
     lite.offset = lite.offset.min(max_offset);
 }
 
-/// True when the active tab exposes the shared device/filesystem picker
-/// (`selected_device` / `selected_fs`) that ↑↓←→ move. On these tabs ←/→
-/// moves the cursor; everywhere else ←/→ cycles tabs.
+/// True when ↑↓ (and Home/End/PageUp/PageDown) have something to move:
+/// the tabs that draw a selection. Devices and SMART draw
+/// `selected_device`, FS draws `selected_fs`, Hot Files draws its own list.
 ///
-/// Volumes has no selection UI of its own yet — despite an earlier version
-/// of this comment claiming otherwise, there is no `selected_container` /
-/// `selected_array` anywhere in the codebase. Treating it as "has a picker"
-/// without one caused ↑↓ (which had no guard at all before) to silently
-/// mutate `selected_device` while on the Volumes tab, corrupting the
-/// Devices/SMART selection the next time either was opened. Volumes stays
-/// out of this list until it actually has something for arrows to move.
-fn picker_active(app: &App) -> bool {
+/// A tab belongs here only if it draws the selection. Volumes and Overview
+/// used to be listed without drawing one, so ↑↓ on them silently changed
+/// `selected_device`, and Devices/SMART showed a different device the next
+/// time either was opened (issue #13).
+fn has_selection(app: &App) -> bool {
     matches!(
         app.active_tab,
-        TabId::Overview | TabId::Devices | TabId::Smart | TabId::Fs
+        TabId::Devices | TabId::Smart | TabId::Fs | TabId::Hot
     )
-}
-
-/// True when ↑↓ (and Home/End/PageUp/PageDown) have something to move:
-/// `picker_active`'s tabs, plus Hot Files' own list. Separate from
-/// `picker_active` because Hot Files keeps ←/→ cycling tabs rather than
-/// moving its cursor — only Overview/Devices/SMART/FS use all four arrows.
-fn has_selection(app: &App) -> bool {
-    picker_active(app) || app.active_tab == TabId::Hot
 }
 
 // Settings modal: how many rows in the dialog. Kept as a constant so
@@ -1238,12 +1204,14 @@ fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
 
     let lines = vec![
         Line::from(""),
-        Line::from(vec![key("Tab / ←→"), desc("previous / next tab")]),
+        Line::from(vec![key("Tab / ←→ / h l"), desc("previous / next tab")]),
         Line::from(vec![key("Shift+Tab"), desc("previous tab")]),
-        Line::from(vec![key("1 — 9"), desc("jump directly to tab N")]),
+        Line::from(vec![key("1 — 8"), desc("jump directly to tab N")]),
         Line::from(""),
-        Line::from(vec![key("↑ ↓ / j k"), desc("move device / fs selection")]),
-        Line::from(vec![key("h l"), desc("move selection (SMART tab)")]),
+        Line::from(vec![
+            key("↑ ↓ / j k"),
+            desc("move device / fs / file selection"),
+        ]),
         Line::from(vec![key("Home End"), desc("jump to first / last")]),
         Line::from(vec![key("PgUp PgDn"), desc("jump by 5")]),
         Line::from(""),
@@ -1715,40 +1683,60 @@ mod tests {
     /// Up/Down had no guard at all, so pressing them on Volumes silently
     /// mutated `selected_device` — the very thing Devices and SMART use —
     /// and the next visit to either tab looked broken for no visible
-    /// reason. `has_selection` now gates Up/Down the same way `picker_
-    /// active` already gated Left/Right.
+    /// reason. `has_selection` now gates Up/Down to tabs that draw a selection.
+    /// Overview had the same bug: it never draws `selected_device` either.
     #[test]
     fn arrows_on_volumes_do_not_corrupt_the_device_picker() {
-        let mut app = App::new(TabId::Overview, ViewMode::Full);
-        app.active_tab = TabId::Volumes;
-        let before = app.selected_device;
-        for key in [
-            KeyCode::Up,
-            KeyCode::Down,
-            KeyCode::Char('j'),
-            KeyCode::Char('k'),
-        ] {
-            super::handle_key(&mut app, key);
+        for tab in [TabId::Volumes, TabId::Overview] {
+            let mut app = App::new(TabId::Overview, ViewMode::Full);
+            app.active_tab = tab;
+            let before = app.selected_device;
+            for key in [
+                KeyCode::Up,
+                KeyCode::Down,
+                KeyCode::Char('j'),
+                KeyCode::Char('k'),
+            ] {
+                super::handle_key(&mut app, key);
+            }
+            assert_eq!(
+                app.selected_device, before,
+                "arrows on {tab:?} must not touch the Devices/SMART selection"
+            );
         }
-        assert_eq!(
-            app.selected_device, before,
-            "arrows on Volumes must not touch the Devices/SMART selection"
-        );
     }
 
-    /// Left/Right still cycle tabs from Volumes (it has no picker to move
-    /// instead) — only the unconditional Up/Down fallthrough was the bug.
+    /// Issue #13: ←→ and h/l must reach every tab, including tabs with a
+    /// selection, wrap at both ends, and leave each list's selection alone.
     #[test]
-    fn left_right_still_cycle_tabs_from_volumes() {
+    fn left_right_cycle_all_tabs_without_moving_selections() {
         let mut app = App::new(TabId::Overview, ViewMode::Full);
-        app.active_tab = TabId::Volumes;
-        super::handle_key(&mut app, KeyCode::Right);
-        assert_ne!(app.active_tab, TabId::Volumes);
+        app.selected_device = 2;
+        app.selected_fs = 3;
+        app.hot_selected = 4;
+        let tabs = super::ALL_TABS;
+        for (key, direction) in [
+            (KeyCode::Right, 1isize),
+            (KeyCode::Left, -1),
+            (KeyCode::Char('l'), 1),
+            (KeyCode::Char('h'), -1),
+        ] {
+            app.active_tab = tabs[0];
+            for step in 1..=tabs.len() * 2 {
+                super::handle_key(&mut app, key);
+                let index = (step as isize * direction).rem_euclid(tabs.len() as isize);
+                assert_eq!(app.active_tab, tabs[index as usize], "{key:?}, step {step}");
+                assert_eq!(
+                    (app.selected_device, app.selected_fs, app.hot_selected),
+                    (2, 3, 4),
+                    "tab navigation must preserve selections"
+                );
+            }
+        }
     }
 
     /// Hot Files gets its own Up/Down-scrollable selection (issue #13's
-    /// "not up or down in the file list"), while Left/Right keep cycling
-    /// tabs there, matching IO and Insights.
+    /// "not up or down in the file list"), while Left/Right cycle tabs.
     #[test]
     fn hot_files_up_down_move_its_own_selection() {
         let mut app = App::new(TabId::Overview, ViewMode::Full);
@@ -1782,7 +1770,7 @@ mod tests {
         super::handle_key(&mut app, KeyCode::Right);
         assert_ne!(
             app.active_tab, before_tab,
-            "Left/Right still cycle tabs from Hot Files, unlike Overview/Devices/SMART/FS"
+            "Left/Right cycle tabs from Hot Files"
         );
     }
 
