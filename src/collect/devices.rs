@@ -22,6 +22,7 @@ use crate::collect::windows;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     Nvme,
     /// Reserved for Linux sysfs classification (SATA SSDs) — macOS reports
     /// these as SATA which we currently bucket as HDD until rotation_rpm
@@ -61,9 +62,7 @@ pub struct DeviceTick {
 }
 
 pub fn collect() -> Vec<DeviceTick> {
-    #[cfg(target_os = "macos")]
-    let mounts_used = sysinfo_mount_used();
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let mounts_used = sysinfo_mount_used();
 
     #[cfg(target_os = "macos")]
@@ -161,7 +160,6 @@ pub fn collect() -> Vec<DeviceTick> {
             .into_iter()
             .map(|w| {
                 let kind = match w.kind {
-                    windows::WindowsKind::Nvme => DeviceKind::Nvme,
                     windows::WindowsKind::Ssd => DeviceKind::Ssd,
                     windows::WindowsKind::Hdd => DeviceKind::Hdd,
                     windows::WindowsKind::UsbMassStorage => DeviceKind::UsbMassStorage,

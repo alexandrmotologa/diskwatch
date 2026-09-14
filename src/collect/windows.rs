@@ -9,7 +9,7 @@
 //! Note: this file is only compiled on Windows. The cfg gate lives at the
 //! module declaration in `collect/mod.rs`.
 
-use sysinfo::Disks;
+use sysinfo::{DiskKind, Disks};
 
 /// Representation of a storage device or volume discovered on Windows.
 #[derive(Debug, Clone, Default)]
@@ -29,10 +29,7 @@ pub struct WindowsDevice {
 /// Hardware drive category on Windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WindowsKind {
-    #[allow(dead_code)]
-    Nvme,
     Ssd,
-    #[allow(dead_code)]
     Hdd,
     UsbMassStorage,
     #[default]
@@ -58,25 +55,27 @@ pub fn collect() -> Vec<WindowsDevice> {
             mount.clone()
         };
 
-        let (kind, bus, model) = if removable {
-            (
-                WindowsKind::UsbMassStorage,
-                "USB".to_string(),
-                format!("Removable Drive ({name})"),
-            )
+        let kind = if removable {
+            WindowsKind::UsbMassStorage
         } else {
-            (
-                WindowsKind::Ssd,
-                "Internal / SATA".to_string(),
-                format!("Local Disk ({name})"),
-            )
+            match d.kind() {
+                DiskKind::SSD => WindowsKind::Ssd,
+                DiskKind::HDD => WindowsKind::Hdd,
+                _ => WindowsKind::Unknown,
+            }
+        };
+
+        let model = if removable {
+            format!("Removable Drive ({name})")
+        } else {
+            format!("Local Disk ({name})")
         };
 
         out.push(WindowsDevice {
             name,
             kind,
             model,
-            bus,
+            bus: String::new(),
             firmware: None,
             serial: None,
             size_bytes: total,
@@ -86,7 +85,5 @@ pub fn collect() -> Vec<WindowsDevice> {
         });
     }
 
-    // Sort largest first, matching macOS and Linux ordering convention.
-    out.sort_by_key(|d| std::cmp::Reverse(d.size_bytes));
     out
 }
