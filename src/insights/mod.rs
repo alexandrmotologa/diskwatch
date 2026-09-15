@@ -334,7 +334,13 @@ fn removable_present(devices: &[DeviceTick]) -> Option<Insight> {
     }
     let body = r
         .iter()
-        .map(|d| format!("  {} — {} ({})", d.name, d.model, d.bus))
+        .map(|d| {
+            if d.bus.is_empty() {
+                format!("  {} — {}", d.name, d.model)
+            } else {
+                format!("  {} — {} ({})", d.name, d.model, d.bus)
+            }
+        })
         .collect();
     Some(Insight {
         sev: Severity::Info,

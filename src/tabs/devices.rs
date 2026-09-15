@@ -169,7 +169,10 @@ fn draw_device_row(f: &mut Frame, x: u16, y: u16, w: u16, d: &DeviceTick, select
         Span::raw(" "),
         Span::styled(pad_right(&d.name, 11), Style::default().fg(name_color)),
         Span::styled(pad_right(&d.model, 32), Style::default().fg(p::fg())),
-        Span::styled(pad_right(&d.bus, 20), Style::default().fg(p::dim())),
+        Span::styled(
+            pad_right(if d.bus.is_empty() { "—" } else { &d.bus }, 20),
+            Style::default().fg(p::dim()),
+        ),
         Span::styled(
             pad_left(&fmt_size(d.size_bytes), 8),
             Style::default().fg(p::dim()),
@@ -279,7 +282,11 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             kv("device", &d.name, p::fg()),
             kv("kind", d.kind.label(), kind_color(d.kind)),
             kv("model", &d.model, p::fg()),
-            kv("bus", &d.bus, p::fg()),
+            kv(
+                "bus",
+                if d.bus.is_empty() { "—" } else { &d.bus },
+                if d.bus.is_empty() { p::dim() } else { p::fg() },
+            ),
             kv(
                 "serial",
                 d.serial.as_deref().unwrap_or("—"),
