@@ -20,7 +20,7 @@ use crate::collect::linux;
 #[cfg(target_os = "windows")]
 use crate::collect::windows;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeviceKind {
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     Nvme,
@@ -31,6 +31,7 @@ pub enum DeviceKind {
     Ssd,
     Hdd,
     UsbMassStorage,
+    #[default]
     Unknown,
 }
 
@@ -158,26 +159,18 @@ pub fn collect() -> Vec<DeviceTick> {
         let wins = windows::collect();
         let mut out: Vec<DeviceTick> = wins
             .into_iter()
-            .map(|w| {
-                let kind = match w.kind {
-                    windows::WindowsKind::Ssd => DeviceKind::Ssd,
-                    windows::WindowsKind::Hdd => DeviceKind::Hdd,
-                    windows::WindowsKind::UsbMassStorage => DeviceKind::UsbMassStorage,
-                    windows::WindowsKind::Unknown => DeviceKind::Unknown,
-                };
-                DeviceTick {
-                    name: w.name,
-                    kind,
-                    model: w.model,
-                    bus: w.bus,
-                    size_bytes: w.size_bytes,
-                    used_bytes: w.used_bytes,
-                    is_removable: w.removable,
-                    firmware: w.firmware,
-                    serial: w.serial,
-                    smart_ok: w.smart_ok,
-                    idle: w.size_bytes == 0,
-                }
+            .map(|w| DeviceTick {
+                name: w.name,
+                kind: w.kind,
+                model: w.model,
+                bus: w.bus,
+                size_bytes: w.size_bytes,
+                used_bytes: w.used_bytes,
+                is_removable: w.removable,
+                firmware: w.firmware,
+                serial: w.serial,
+                smart_ok: w.smart_ok,
+                idle: w.size_bytes == 0,
             })
             .collect();
         out.sort_by_key(|d| std::cmp::Reverse(d.size_bytes));

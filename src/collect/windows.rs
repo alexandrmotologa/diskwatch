@@ -11,11 +11,13 @@
 
 use sysinfo::{DiskKind, Disks};
 
+use crate::collect::DeviceKind;
+
 /// Representation of a storage device or volume discovered on Windows.
 #[derive(Debug, Clone, Default)]
 pub struct WindowsDevice {
     pub name: String,
-    pub kind: WindowsKind,
+    pub kind: DeviceKind,
     pub model: String,
     pub bus: String,
     pub firmware: Option<String>,
@@ -26,14 +28,13 @@ pub struct WindowsDevice {
     pub smart_ok: Option<bool>,
 }
 
-/// Hardware drive category on Windows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum WindowsKind {
-    Ssd,
-    Hdd,
-    UsbMassStorage,
-    #[default]
-    Unknown,
+/// Normalise a mount path to a bare drive letter (e.g. `"C:\\"` -> `"C:"`).
+pub fn normalize_drive_name(mount: &str) -> String {
+    if mount.ends_with('\\') || mount.ends_with('/') {
+        mount.trim_end_matches(['\\', '/']).to_string()
+    } else {
+        mount.to_string()
+    }
 }
 
 /// Enumerate storage devices and attached volumes.
@@ -48,20 +49,15 @@ pub fn collect() -> Vec<WindowsDevice> {
         let used = total.saturating_sub(avail);
         let removable = d.is_removable();
 
-        // Clean name (e.g. "C:" from "C:\\")
-        let name = if mount.ends_with('\\') || mount.ends_with('/') {
-            mount.trim_end_matches(['\\', '/']).to_string()
-        } else {
-            mount.clone()
-        };
+        let name = normalize_drive_name(&mount);
 
         let kind = if removable {
-            WindowsKind::UsbMassStorage
+            DeviceKind::UsbMassStorage
         } else {
             match d.kind() {
-                DiskKind::SSD => WindowsKind::Ssd,
-                DiskKind::HDD => WindowsKind::Hdd,
-                _ => WindowsKind::Unknown,
+                DiskKind::SSD => DeviceKind::Ssd,
+                DiskKind::HDD => DeviceKind::Hdd,
+                _ => DeviceKind::Unknown,
             }
         };
 
