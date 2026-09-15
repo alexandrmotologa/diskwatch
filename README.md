@@ -97,7 +97,8 @@ x eget use matthart1983/diskwatch     # prebuilt release binary
 
 Or a pre-built binary from [Releases](https://github.com/matthart1983/diskwatch/releases/latest)
 — Linux and macOS, x86_64 and aarch64, plus static musl builds, plus an armv5te build for older
-Marvell Kirkwood NAS boxes (e.g. Iomega ix2-dl) running Debian.
+Marvell Kirkwood NAS boxes (e.g. Iomega ix2-dl) running Debian. Windows x86_64 binaries
+are also available; extract the archive and run `diskwatch-windows-x86_64.exe`.
 
 No system dependencies on Linux. macOS uses the preinstalled `ioreg`, `diskutil` and
 `system_profiler`. Optional: `smartmontools` for full SMART attribute tables; without it the

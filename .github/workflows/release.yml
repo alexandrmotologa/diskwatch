@@ -10,6 +10,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -33,6 +34,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             name: diskwatch-macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: diskwatch-windows-x86_64
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -72,9 +76,14 @@ jobs:
           fi
 
       - name: Package
+        shell: bash
         run: |
-          cp target/${{ matrix.target }}/release/diskwatch ${{ matrix.name }}
-          tar czf ${{ matrix.name }}.tar.gz ${{ matrix.name }}
+          suffix=""
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            suffix=".exe"
+          fi
+          cp "target/${{ matrix.target }}/release/diskwatch${suffix}" "${{ matrix.name }}${suffix}"
+          tar czf "${{ matrix.name }}.tar.gz" "${{ matrix.name }}${suffix}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
