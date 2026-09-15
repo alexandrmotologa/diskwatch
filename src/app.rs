@@ -1710,7 +1710,30 @@ mod tests {
     /// selection, wrap at both ends, and leave each list's selection alone.
     #[test]
     fn left_right_cycle_all_tabs_without_moving_selections() {
-        let mut app = App::new(TabId::Overview, ViewMode::Full);
+        let mut opts = Options::new(TabId::Overview, ViewMode::Full);
+        opts.watch_roots.clear();
+        let mut app = App::with_options(opts);
+        // Navigation clamps Hot Files to its actual list length. Seed a
+        // valid selection without a live watcher adding machine-dependent
+        // activity (an empty list correctly resets the cursor to zero).
+        {
+            let mut state = app.hot_files.state.lock().unwrap();
+            for i in 0..5 {
+                let path = PathBuf::from(format!("navigation-fixture-{i}"));
+                state.activity.insert(
+                    path.clone(),
+                    collect::hot_files::FileActivity {
+                        path,
+                        events_per_sec: (5 - i) as f64,
+                        total_events: 1,
+                        last_kind: collect::hot_files::ActivityKind::Modified,
+                        last_seen: Instant::now(),
+                        history: Default::default(),
+                        pushed: 0,
+                    },
+                );
+            }
+        }
         app.selected_device = 2;
         app.selected_fs = 3;
         app.hot_selected = 4;
