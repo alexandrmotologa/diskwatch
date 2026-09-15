@@ -437,6 +437,29 @@ mod tests {
         assert_eq!(inverted, vec![PathBuf::from("/a")]);
     }
 
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn nested_roots_pruning_with_real_filesystem_paths() {
+        let temp_dir = std::env::temp_dir().join(format!("dw_test_{}", std::process::id()));
+        let _guard = TempDirGuard(temp_dir.clone());
+        let parent = temp_dir.join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let roots = resolve_roots(Some(vec![parent.clone(), child.clone()]), &[]);
+        assert_eq!(roots, vec![parent.clone()]);
+
+        let inverted = resolve_roots(Some(vec![child]), std::slice::from_ref(&parent));
+        assert_eq!(inverted, vec![parent]);
+    }
+
     /// `notify` maps the inotify budget being exhausted to its own error
     /// kind rather than the kernel's ENOSPC, so matching on the io error
     /// would silently never fire and users would keep seeing "OS file

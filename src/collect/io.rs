@@ -274,6 +274,10 @@ pub struct IoCollector {
     /// Host-wide 1 Hz rings. See [`AggHistory`].
     pub agg: AggHistory,
     pub latest: Vec<IoTick>,
+    #[cfg(target_os = "windows")]
+    cached_drives: Vec<WindowsDrive>,
+    #[cfg(target_os = "windows")]
+    last_drives_refresh: Instant,
 }
 
 impl IoCollector {
@@ -285,6 +289,10 @@ impl IoCollector {
             history: HashMap::new(),
             agg: AggHistory::default(),
             latest: Vec::new(),
+            #[cfg(target_os = "windows")]
+            cached_drives: enumerate_windows_drives(),
+            #[cfg(target_os = "windows")]
+            last_drives_refresh: Instant::now(),
         }
     }
 
@@ -453,7 +461,7 @@ impl IoCollector {
         self.prev_totals = totals;
     }
 
-    fn read_totals(&self) -> HashMap<String, DeviceTotals> {
+    fn read_totals(&mut self) -> HashMap<String, DeviceTotals> {
         #[cfg(target_os = "macos")]
         {
             totals_macos()
@@ -464,7 +472,13 @@ impl IoCollector {
         }
         #[cfg(target_os = "windows")]
         {
-            totals_windows()
+            // Re-enumerate drives every 10s to discover hot-plugged devices (USB, etc.),
+            // avoiding heavy sysinfo volume queries on every 5Hz sample.
+            if self.last_drives_refresh.elapsed() >= Duration::from_secs(10) {
+                self.cached_drives = enumerate_windows_drives();
+                self.last_drives_refresh = Instant::now();
+            }
+            totals_windows(&self.cached_drives)
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
@@ -474,11 +488,288 @@ impl IoCollector {
 }
 
 #[cfg(target_os = "windows")]
-fn totals_windows() -> HashMap<String, DeviceTotals> {
-    // Windows I/O metrics: uncollected counters return an empty map,
-    // causing the TUI to cleanly display '--' while device discovery and
-    // capacity gauges run natively.
-    HashMap::new()
+struct WindowsDrive {
+    name: String,
+    device_path: Vec<u16>,
+}
+
+#[cfg(target_os = "windows")]
+fn enumerate_windows_drives() -> Vec<WindowsDrive> {
+    use sysinfo::Disks;
+
+    let disks = Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter_map(|d| {
+            let mount = d.mount_point().to_string_lossy();
+            Some(WindowsDrive {
+                name: crate::collect::windows::normalize_drive_name(&mount),
+                device_path: win32::volume_device_path(d.mount_point())?,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn totals_windows(drives: &[WindowsDrive]) -> HashMap<String, DeviceTotals> {
+    let mut out = HashMap::new();
+    const TICKS_TO_NS: u64 = 100;
+
+    for drive in drives {
+        let Some(perf) = win32::query_disk_performance(&drive.device_path) else {
+            continue;
+        };
+
+        out.insert(
+            drive.name.clone(),
+            DeviceTotals {
+                bytes_read: perf.bytes_read as u64,
+                bytes_written: perf.bytes_written as u64,
+                ops_read: perf.read_count as u64,
+                ops_written: perf.write_count as u64,
+                total_time_read_ns: (perf.read_time as u64).saturating_mul(TICKS_TO_NS),
+                total_time_write_ns: (perf.write_time as u64).saturating_mul(TICKS_TO_NS),
+                // Windows does not expose a cumulative busy-time counter the
+                // way Linux's io_ticks does, so utilisation stays `--`.
+                busy_ns: None,
+                inflight: Some(perf.queue_depth),
+            },
+        );
+    }
+    out
+}
+
+/// Minimal Win32 FFI for `IOCTL_DISK_PERFORMANCE`.
+///
+/// Declared here rather than pulling in the `windows` or `winapi` crate so
+/// the dependency list stays unchanged. Every symbol is private to this
+/// module; volume paths are resolved on discovery and queried on each tick.
+#[cfg(target_os = "windows")]
+mod win32 {
+    use std::mem;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr;
+
+    // --- handles and flags ---------------------------------------------------
+    type Handle = *mut std::ffi::c_void;
+    const INVALID_HANDLE: Handle = -1_isize as Handle;
+    // IOCTL_DISK_PERFORMANCE is defined with FILE_ANY_ACCESS, so access 0 is
+    // sufficient. Opening volume handles (\\.\C:) with read access requires
+    // elevated administrator rights, whereas access 0 allows standard,
+    // unprivileged users to query drive performance counters.
+    const FILE_QUERY_ACCESS: u32 = 0;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
+
+    /// `CTL_CODE(IOCTL_DISK_BASE, 0x0008, METHOD_BUFFERED, FILE_ANY_ACCESS)`
+    const IOCTL_DISK_PERFORMANCE: u32 = 0x0007_0020;
+
+    // --- DISK_PERFORMANCE layout (88 bytes on x86-64) ------------------------
+    // https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-disk_performance
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct DiskPerformance {
+        pub bytes_read: i64,
+        pub bytes_written: i64,
+        pub read_time: i64,
+        pub write_time: i64,
+        pub idle_time: i64,
+        pub read_count: u32,
+        pub write_count: u32,
+        pub queue_depth: u32,
+        pub split_count: u32,
+        pub query_time: i64,
+        pub storage_device_number: u32,
+        pub storage_manager_name: [u16; 8],
+    }
+
+    extern "system" {
+        fn GetVolumeNameForVolumeMountPointW(
+            mount_point: *const u16,
+            volume_name: *mut u16,
+            buffer_length: u32,
+        ) -> i32;
+
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut std::ffi::c_void,
+            disposition: u32,
+            flags: u32,
+            template: Handle,
+        ) -> Handle;
+
+        fn DeviceIoControl(
+            device: Handle,
+            control_code: u32,
+            in_buffer: *mut std::ffi::c_void,
+            in_size: u32,
+            out_buffer: *mut std::ffi::c_void,
+            out_size: u32,
+            bytes_returned: *mut u32,
+            overlapped: *mut std::ffi::c_void,
+        ) -> i32;
+
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+
+    /// Resolve a drive root or mounted folder to a volume device path.
+    /// Keep this separate from the display name: `\\.\C:\Data` names a
+    /// directory, whereas CreateFileW needs `\\?\Volume{GUID}` for its volume.
+    /// Resolution happens on the 10s discovery cadence, not every I/O tick.
+    pub fn volume_device_path(mount: &Path) -> Option<Vec<u16>> {
+        let mut wide: Vec<u16> = mount.as_os_str().encode_wide().collect();
+        if wide.last() != Some(&(b'\\' as u16)) {
+            wide.push(b'\\' as u16);
+        }
+        wide.push(0);
+        // Microsoft documents 50 WCHARs as sufficient for a volume GUID path.
+        let mut volume = [0u16; 50];
+        let ok = unsafe {
+            GetVolumeNameForVolumeMountPointW(
+                wide.as_ptr(),
+                volume.as_mut_ptr(),
+                volume.len() as u32,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let end = volume.iter().position(|&c| c == 0)?;
+        // The API returns a root path with a trailing backslash. Omit it
+        // when opening the volume itself, and retain the UTF-16 terminator.
+        let end = end.checked_sub(1)?;
+        if volume[end] != b'\\' as u16 {
+            return None;
+        }
+        let mut device = volume[..end].to_vec();
+        device.push(0);
+        Some(device)
+    }
+
+    /// Query cumulative I/O counters using a resolved, null-terminated
+    /// volume device path (without a trailing backslash).
+    ///
+    /// Returns `None` when the drive cannot be opened or the ioctl fails —
+    /// both are normal on drives that don't support the performance counter
+    /// (e.g. network-mapped or some virtual drives).
+    pub fn query_disk_performance(device_path: &[u16]) -> Option<DiskPerformance> {
+        let handle = unsafe {
+            CreateFileW(
+                device_path.as_ptr(),
+                FILE_QUERY_ACCESS,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE {
+            return None;
+        }
+
+        let mut perf: DiskPerformance = unsafe { mem::zeroed() };
+        let mut returned: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_DISK_PERFORMANCE,
+                ptr::null_mut(),
+                0,
+                &mut perf as *mut _ as *mut std::ffi::c_void,
+                mem::size_of::<DiskPerformance>() as u32,
+                &mut returned,
+                ptr::null_mut(),
+            )
+        };
+        unsafe { CloseHandle(handle) };
+
+        if ok == 0 {
+            return None;
+        }
+        Some(perf)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        extern "system" {
+            fn SetVolumeMountPointW(mount_point: *const u16, volume_name: *const u16) -> i32;
+            fn DeleteVolumeMountPointW(mount_point: *const u16) -> i32;
+        }
+
+        struct MountedFolder {
+            path: std::path::PathBuf,
+            wide: Vec<u16>,
+            mounted: bool,
+        }
+
+        impl Drop for MountedFolder {
+            fn drop(&mut self) {
+                if self.mounted {
+                    unsafe { DeleteVolumeMountPointW(self.wide.as_ptr()) };
+                }
+                // Never recursively delete a mount: even if detaching failed,
+                // cleanup must not descend into the mounted volume.
+                let _ = std::fs::remove_dir(&self.path);
+            }
+        }
+
+        #[test]
+        #[ignore = "requires administrator rights to create a volume mount; run by Windows CI"]
+        fn windows_folder_mount_reads_io_counters() {
+            let root = std::env::var_os("SystemDrive").expect("Windows system drive");
+            let device = volume_device_path(Path::new(&root)).expect("system volume GUID");
+            let mut volume_root = device[..device.len() - 1].to_vec();
+            volume_root.extend([b'\\' as u16, 0]);
+
+            let path = std::env::temp_dir().join(format!(
+                "diskwatch-mount-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&path).expect("create empty mount folder");
+            let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+            wide.extend([b'\\' as u16, 0]);
+            let mut folder = MountedFolder {
+                path,
+                wide,
+                mounted: false,
+            };
+            let ok = unsafe { SetVolumeMountPointW(folder.wide.as_ptr(), volume_root.as_ptr()) };
+            assert_ne!(
+                ok,
+                0,
+                "mount system volume: {}",
+                std::io::Error::last_os_error()
+            );
+            folder.mounted = true;
+
+            let resolved = volume_device_path(&folder.path).expect("mounted folder GUID");
+            assert_eq!(
+                resolved, device,
+                "folder and drive letter name the same volume"
+            );
+            let name =
+                crate::collect::windows::normalize_drive_name(&folder.path.to_string_lossy());
+            let drives = super::super::enumerate_windows_drives();
+            assert!(drives
+                .iter()
+                .any(|d| d.name == name && d.device_path == device));
+            let totals = super::super::totals_windows(&drives);
+            let counters = totals.get(&name).expect("mounted folder has I/O counters");
+            assert!(counters.bytes_read > 0 || counters.bytes_written > 0);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -855,5 +1146,19 @@ mod diskstats_tests {
         let sum = h.hist_sum();
         assert_eq!(sum[LAT_BUCKETS - 1], 0, "the old burst never aged out");
         assert_eq!(sum[0], LATENCY_WINDOW as u64);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_totals_queries_system_drives() {
+        let drives = enumerate_windows_drives();
+        let totals = totals_windows(&drives);
+        if std::path::Path::new("C:\\").exists() {
+            let c = totals
+                .get("C:")
+                .expect("C: drive must be collected in Windows totals");
+            assert!(c.bytes_read > 0 || c.bytes_written > 0);
+            assert!(c.ops_read > 0 || c.ops_written > 0);
+        }
     }
 }
